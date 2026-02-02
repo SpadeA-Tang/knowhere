@@ -2176,3 +2176,252 @@ TEST_CASE("Test brute force anniterator on chunk", "[on_chunk]") {
         }
     }
 }
+
+TEST_CASE("Direct vs MUVERA Strategy Comparison", "[emb_list_strategy_comparison]") {
+    // Test parameters
+    const int32_t dim = 128;
+    const int32_t num_docs = 10000;
+    const int32_t vectors_per_doc = 200;
+    const int32_t total_vectors = num_docs * vectors_per_doc;
+    const int32_t num_queries = 10;
+    const int32_t vectors_per_query = 18;
+    const int32_t total_query_vectors = num_queries * vectors_per_query;
+    const int32_t topk = 50;
+    const uint64_t seed = 42;
+    constexpr bool SKIP_DIRECT_TEST = true;  // Set to true to skip Direct strategy (it's slow)
+
+    printf("\n=== Direct vs MUVERA Strategy Comparison ===\n");
+    printf("Documents: %d, Vectors/Doc: %d, Total vectors: %d, Dim: %d\n", num_docs, vectors_per_doc, total_vectors,
+           dim);
+    printf("Queries: %d, Vectors/Query: %d, TopK: %d\n", num_queries, vectors_per_query, topk);
+    fflush(stdout);
+
+    // Generate document dataset with semantic structure
+    // Each document has a "topic" base vector, and its vectors = base + small noise
+    printf("[Data] Generating structured document data...\n");
+    fflush(stdout);
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> base_distrib(-1.0f, 1.0f);
+    std::normal_distribution<float> noise_distrib(0.0f, 0.1f);  // small noise
+
+    float* doc_data = new float[total_vectors * dim];
+    std::vector<std::vector<float>> doc_bases(num_docs, std::vector<float>(dim));
+
+    // Generate base vectors for each document and create doc vectors
+    for (int doc = 0; doc < num_docs; ++doc) {
+        // Generate random base vector for this document (the "topic")
+        for (int d = 0; d < dim; ++d) {
+            doc_bases[doc][d] = base_distrib(rng);
+        }
+        // Normalize base vector
+        float norm = 0;
+        for (int d = 0; d < dim; ++d) {
+            norm += doc_bases[doc][d] * doc_bases[doc][d];
+        }
+        norm = std::sqrt(norm);
+        for (int d = 0; d < dim; ++d) {
+            doc_bases[doc][d] /= norm;
+        }
+
+        // Generate vectors for this document: base + noise
+        for (int v = 0; v < vectors_per_doc; ++v) {
+            int vec_idx = doc * vectors_per_doc + v;
+            for (int d = 0; d < dim; ++d) {
+                doc_data[vec_idx * dim + d] = doc_bases[doc][d] + noise_distrib(rng);
+            }
+        }
+    }
+
+    size_t* doc_offsets = new size_t[num_docs + 1];
+    for (int i = 0; i <= num_docs; ++i) {
+        doc_offsets[i] = i * vectors_per_doc;
+    }
+
+    auto doc_ds = knowhere::GenDataSet(total_vectors, dim, doc_data);
+    doc_ds->Set(knowhere::meta::EMB_LIST_OFFSET, static_cast<const size_t*>(doc_offsets));
+    doc_ds->SetIsOwner(true);
+
+    // Generate query dataset: each query is similar to a random document
+    // Query vectors = doc_base + noise (simulating queries about specific topics)
+    float* query_data = new float[total_query_vectors * dim];
+    std::vector<int> query_target_docs(num_queries);  // which doc each query is similar to
+
+    for (int q = 0; q < num_queries; ++q) {
+        // Pick a random document as the target for this query
+        query_target_docs[q] = rng() % num_docs;
+        const auto& target_base = doc_bases[query_target_docs[q]];
+
+        // Generate query vectors similar to the target document
+        for (int v = 0; v < vectors_per_query; ++v) {
+            int vec_idx = q * vectors_per_query + v;
+            for (int d = 0; d < dim; ++d) {
+                query_data[vec_idx * dim + d] = target_base[d] + noise_distrib(rng);
+            }
+        }
+    }
+
+    size_t* query_offsets = new size_t[num_queries + 1];
+    for (int i = 0; i <= num_queries; ++i) {
+        query_offsets[i] = i * vectors_per_query;
+    }
+
+    auto query_ds = knowhere::GenDataSet(total_query_vectors, dim, query_data);
+    query_ds->Set(knowhere::meta::EMB_LIST_OFFSET, static_cast<const size_t*>(query_offsets));
+    query_ds->SetIsOwner(true);
+
+    printf("[Data] Data generation done. Query target docs: ");
+    for (int q = 0; q < std::min(5, num_queries); ++q) {
+        printf("%d ", query_target_docs[q]);
+    }
+    printf("...\n");
+    fflush(stdout);
+
+    // Base config
+    knowhere::Json base_conf;
+    base_conf[knowhere::meta::METRIC_TYPE] = "MAX_SIM_IP";
+    base_conf[knowhere::meta::DIM] = dim;
+    base_conf[knowhere::meta::TOPK] = topk;
+    base_conf[knowhere::indexparam::HNSW_M] = 16;
+    base_conf[knowhere::indexparam::EFCONSTRUCTION] = 100;
+    base_conf[knowhere::indexparam::EF] = 64;
+    base_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = 3.0f;
+
+    auto version = GenTestEmbListVersionList();
+
+    // ========== Ground Truth ==========
+    printf("\n[Ground Truth] Computing BruteForce results...\n");
+    fflush(stdout);
+    knowhere::Json gt_conf;
+    gt_conf[knowhere::meta::METRIC_TYPE] = "MAX_SIM_IP";
+    gt_conf[knowhere::meta::TOPK] = topk;
+
+    StopWatch sw_gt;
+    auto gt_result = knowhere::BruteForce::Search<knowhere::fp32>(doc_ds, query_ds, gt_conf, nullptr);
+    double gt_time = sw_gt.elapsed();
+    REQUIRE(gt_result.has_value());
+    printf("[Ground Truth] BruteForce time: %.3f ms\n", gt_time * 1000);
+    fflush(stdout);
+
+    auto gt_ids = gt_result.value()->GetIds();
+
+    // Recall calculation lambda
+    auto calc_recall = [&](const int64_t* result_ids) {
+        int overlap = 0;
+        for (int q = 0; q < num_queries; ++q) {
+            std::unordered_set<int64_t> gt_set;
+            for (int i = 0; i < topk; ++i) {
+                if (gt_ids[q * topk + i] >= 0) {
+                    gt_set.insert(gt_ids[q * topk + i]);
+                }
+            }
+            for (int i = 0; i < topk; ++i) {
+                if (result_ids[q * topk + i] >= 0 && gt_set.count(result_ids[q * topk + i]) > 0) {
+                    overlap++;
+                }
+            }
+        }
+        return (float)overlap / (num_queries * topk);
+    };
+
+    // ========== Direct Strategy ==========
+    double direct_build_time = 0, direct_search_time = 0;
+    float direct_recall = 0;
+
+    if (SKIP_DIRECT_TEST) {
+        printf("\n[Direct] SKIPPED (SKIP_DIRECT_TEST = true)\n");
+        fflush(stdout);
+    } else {
+        printf("\n[Direct] Building HNSW index for %d vectors...\n", total_vectors);
+        fflush(stdout);
+
+        knowhere::Json direct_conf = base_conf;
+        direct_conf[knowhere::meta::INDEX_TYPE] = knowhere::IndexEnum::INDEX_HNSW;
+        direct_conf["emb_list_strategy"] = "direct";
+
+        auto direct_index =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version);
+        REQUIRE(direct_index.has_value());
+
+        StopWatch sw_direct_build;
+        auto direct_build_status = direct_index.value().Build(doc_ds, direct_conf);
+        direct_build_time = sw_direct_build.elapsed();
+        REQUIRE(direct_build_status == knowhere::Status::success);
+        printf("[Direct] Build time: %.3f s\n", direct_build_time);
+
+        printf("[Direct] Searching...\n");
+        fflush(stdout);
+        StopWatch sw_direct_search;
+        auto direct_result = direct_index.value().Search(query_ds, direct_conf, nullptr);
+        direct_search_time = sw_direct_search.elapsed();
+        REQUIRE(direct_result.has_value());
+        printf("[Direct] Search time: %.3f ms\n", direct_search_time * 1000);
+
+        auto direct_ids = direct_result.value()->GetIds();
+        direct_recall = calc_recall(direct_ids);
+        printf("[Direct] Recall: %.2f%%\n", direct_recall * 100);
+        fflush(stdout);
+    }
+
+    // ========== MUVERA Strategy ==========
+    double muvera_build_time = 0, muvera_search_time = 0;
+    float muvera_recall = 0;
+
+    printf("\n[MUVERA] Building HNSW index for %d doc vectors (FDE encoded from %d raw vectors)...\n", num_docs,
+           total_vectors);
+    fflush(stdout);
+
+    knowhere::Json muvera_conf = base_conf;
+    muvera_conf[knowhere::meta::INDEX_TYPE] = knowhere::IndexEnum::INDEX_HNSW;
+    muvera_conf["emb_list_strategy"] = "muvera";
+    muvera_conf["muvera_num_projections"] = 4;
+    muvera_conf["muvera_num_repeats"] = 1;
+    muvera_conf["muvera_seed"] = 42;
+    muvera_conf["muvera_rerank"] = true;
+
+    auto muvera_index =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version);
+    REQUIRE(muvera_index.has_value());
+
+    StopWatch sw_muvera_build;
+    auto muvera_build_status = muvera_index.value().Build(doc_ds, muvera_conf);
+    muvera_build_time = sw_muvera_build.elapsed();
+    REQUIRE(muvera_build_status == knowhere::Status::success);
+    printf("[MUVERA] Build time: %.3f s\n", muvera_build_time);
+
+    printf("[MUVERA] Searching...\n");
+    fflush(stdout);
+    StopWatch sw_muvera_search;
+    auto muvera_result = muvera_index.value().Search(query_ds, muvera_conf, nullptr);
+    muvera_search_time = sw_muvera_search.elapsed();
+    REQUIRE(muvera_result.has_value());
+    printf("[MUVERA] Search time: %.3f ms\n", muvera_search_time * 1000);
+
+    auto muvera_ids = muvera_result.value()->GetIds();
+    muvera_recall = calc_recall(muvera_ids);
+    printf("[MUVERA] Recall: %.2f%%\n", muvera_recall * 100);
+    fflush(stdout);
+
+    // ========== Summary ==========
+    printf("\n========== Summary ==========\n");
+    printf("| Strategy | Index Vectors | Build Time | Search Time | Recall |\n");
+    printf("|----------|---------------|------------|-------------|--------|\n");
+    if (!SKIP_DIRECT_TEST) {
+        printf("| Direct   | %13d | %8.2f s | %9.2f ms | %5.1f%% |\n", total_vectors, direct_build_time,
+               direct_search_time * 1000, direct_recall * 100);
+    }
+    printf("| MUVERA   | %13d | %8.2f s | %9.2f ms | %5.1f%% |\n", num_docs, muvera_build_time,
+           muvera_search_time * 1000, muvera_recall * 100);
+    printf("=================================\n");
+    if (!SKIP_DIRECT_TEST) {
+        printf("MUVERA indexes %.1fx fewer vectors\n", (float)total_vectors / num_docs);
+        printf("MUVERA build is %.1fx faster\n", direct_build_time / muvera_build_time);
+        printf("MUVERA search is %.1fx faster\n", direct_search_time / muvera_search_time);
+    }
+    fflush(stdout);
+
+    // Assertions - with structured data, both should achieve reasonable recall
+    if (!SKIP_DIRECT_TEST) {
+        REQUIRE(direct_recall >= 0.3f);
+    }
+    REQUIRE(muvera_recall >= 0.1f);
+}

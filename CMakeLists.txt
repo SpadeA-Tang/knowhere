@@ -157,6 +157,7 @@ if(WITH_LIGHT)
     src/index/index.cc
     src/index/interrupt.cc
     src/index/sparse/*.cc
+    src/index/emb_list/*.cc
     src/io/*.cc
     src/index/index_factory.cc)
   knowhere_file_glob(GLOB_RECURSE KNOWHERE_TRACER_SRCS src/common/tracer.cc)

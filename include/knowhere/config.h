@@ -634,6 +634,18 @@ class BaseConfig : public Config {
     CFG_FLOAT retrieval_ann_ratio;
     CFG_STRING emb_list_meta_file_path;    // for mmap
     CFG_STRING emb_list_offset_file_path;  // for build
+    /*
+     * emb_list_strategy: encoding strategy for multi-vector documents.
+     * - "direct": Index all vectors, aggregate scores at search time (default)
+     * - "muvera": Encode documents to single vectors using FDE, rerank with MaxSim
+     */
+    CFG_STRING emb_list_strategy;
+    CFG_FLOAT emb_list_rerank_ratio;       // rerank candidate ratio for MUVERA
+    CFG_INT muvera_num_projections;        // FDE projections count, buckets = 2^projections
+    CFG_INT muvera_num_repeats;            // FDE repeat count (independent encodings)
+    CFG_INT muvera_seed;                   // random seed for SimHash projection matrices
+    CFG_BOOL muvera_store_raw_data;        // store raw data for reranking
+    CFG_BOOL muvera_rerank;                // whether to perform MaxSim reranking (trade recall for latency)
     KNOHWERE_DECLARE_CONFIG(BaseConfig) {
         KNOWHERE_CONFIG_DECLARE_FIELD(dim).allow_empty_without_default().description("vector dim").for_train();
         KNOWHERE_CONFIG_DECLARE_FIELD(metric_type)
@@ -800,6 +812,39 @@ class BaseConfig : public Config {
             .description("file name of emb_list offsets for build")
             .allow_empty_without_default()
             .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(emb_list_strategy)
+            .description("EmbList encoding strategy: direct or muvera")
+            .set_default("direct")
+            .for_train()
+            .for_deserialize()
+            .for_deserialize_from_file();
+        KNOWHERE_CONFIG_DECLARE_FIELD(emb_list_rerank_ratio)
+            .description("Rerank candidate ratio for MUVERA strategy")
+            .set_default(10.0f)
+            .set_range(1.0f, 1000.0f)
+            .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(muvera_num_projections)
+            .description("Number of SimHash projections for MUVERA FDE, buckets = 2^projections")
+            .set_default(5)
+            .set_range(1, 8)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(muvera_num_repeats)
+            .description("Number of repeats for MUVERA FDE encoding")
+            .set_default(8)
+            .set_range(1, 64)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(muvera_seed)
+            .description("Random seed for MUVERA SimHash projection matrices")
+            .set_default(42)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(muvera_store_raw_data)
+            .description("Whether to store raw data for MUVERA reranking")
+            .set_default(true)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(muvera_rerank)
+            .description("Whether to perform MaxSim reranking after ANN search (false = trade recall for latency)")
+            .set_default(true)
+            .for_search();
     }
 };
 }  // namespace knowhere

@@ -12,6 +12,7 @@
 #ifndef INDEX_NODE_H
 #define INDEX_NODE_H
 
+#include <fstream>
 #include <functional>
 #include <queue>
 #include <utility>
@@ -23,6 +24,7 @@
 #include "knowhere/dataset.h"
 #include "knowhere/emb_list_utils.h"
 #include "knowhere/expected.h"
+#include "knowhere/index/emb_list_strategy.h"
 #include "knowhere/object.h"
 #include "knowhere/operands.h"
 #include "knowhere/utils.h"
@@ -359,37 +361,62 @@ class IndexNode : public Object {
     virtual Status
     BuildEmbList(const DataSetPtr dataset, std::shared_ptr<Config> cfg, const size_t* lims, size_t num_rows,
                  bool use_knowhere_build_pool = true) {
-        // 1. split metric_type to el_metric_type and sub_metric_type
         auto& config = static_cast<BaseConfig&>(*cfg);
         auto original_metric_type = config.metric_type.value();
+
+        // 1. Parse metric types
         auto el_metric_type_or = get_el_metric_type(original_metric_type);
         if (!el_metric_type_or.has_value()) {
             LOG_KNOWHERE_WARNING_ << "Invalid metric type for emb_list: " << original_metric_type;
             return Status::emb_list_inner_error;
         }
-        auto el_metric_type = el_metric_type_or.value();
+        el_metric_type_ = el_metric_type_or.value();
+
         auto sub_metric_type_or = get_sub_metric_type(original_metric_type);
         if (!sub_metric_type_or.has_value()) {
             LOG_KNOWHERE_WARNING_ << "Invalid sub metric type for emb_list: " << original_metric_type;
             return Status::emb_list_inner_error;
         }
-        // set sub metric type as the metric type for build
         auto sub_metric_type = sub_metric_type_or.value();
         config.metric_type = sub_metric_type;
 
-        // 2. build index
-        LOG_KNOWHERE_INFO_ << "Build EmbList-Index with metric type: " << original_metric_type
-                           << ", el metric type: " << el_metric_type << ", sub metric type: " << sub_metric_type;
-        RETURN_IF_ERROR(Build(dataset, cfg, use_knowhere_build_pool));
+        // 2. Create document offset structure
+        EmbListOffset doc_offset(lims, num_rows);
 
-        // 3. create emb_list_offset
-        emb_list_offset_ = std::make_unique<EmbListOffset>(lims, num_rows);
+        // 3. Create emb_list strategy
+        auto strategy_type = config.emb_list_strategy.value_or("direct");
+        auto strategy_or = CreateEmbListStrategy(strategy_type, config);
+        if (!strategy_or.has_value()) {
+            LOG_KNOWHERE_WARNING_ << "Failed to create emb_list strategy: " << strategy_type;
+            return strategy_or.error();
+        }
+        emb_list_strategy_ = std::move(strategy_or.value());
 
-        // 4. Set the mapping from base index internal vector IDs to emb_list IDs.
-        // When using emb_list, all filtering bitset checks are performed at the emb_list level,
-        // not at the individual vector level. This means that whenever the index needs to check whether
-        // a vector is masked (filtered out), it must first map the vector's idx to its corresponding emb_list idx.
-        return SetBaseIndexIDMap();
+        // 4. Prepare data for build (strategy may transform data, e.g., FDE encoding)
+        auto build_data_or = emb_list_strategy_->PrepareDataForBuild(dataset, doc_offset, config);
+        if (!build_data_or.has_value()) {
+            LOG_KNOWHERE_WARNING_ << "Failed to prepare data for build";
+            return build_data_or.error();
+        }
+
+        // 5. Build underlying index (if strategy provides data)
+        LOG_KNOWHERE_INFO_ << "Build EmbList-Index with strategy: " << strategy_type
+                           << ", metric type: " << original_metric_type
+                           << ", sub metric type: " << sub_metric_type;
+        if (build_data_or.value().has_value()) {
+            RETURN_IF_ERROR(Build(build_data_or.value().value(), cfg, use_knowhere_build_pool));
+        }
+
+        // 6. Strategy post-build hook
+        RETURN_IF_ERROR(emb_list_strategy_->OnBuildComplete(dataset, doc_offset, config));
+
+        // 7. Set ID mapping if strategy requires it (Direct needs vector->doc mapping)
+        if (emb_list_strategy_->NeedsBaseIndexIDMap()) {
+            emb_list_offset_ = emb_list_strategy_->GetEmbListOffset();
+            return SetBaseIndexIDMap();
+        }
+
+        return Status::success;
     }
 
     virtual Status
@@ -456,28 +483,29 @@ class IndexNode : public Object {
      */
     virtual Status
     SerializeEmbListIfNeed(BinarySet& binset) const {
-        if (emb_list_offset_ == nullptr || emb_list_offset_->offset.size() == 0) {
-            // if not emb_list, use the default serialize method
+        if (!emb_list_strategy_) {
+            // not emb_list, use the default serialize method
             return Serialize(binset);
         }
 
-        // if is emb_list,
-        //   1. serialize emb_list offset
-        //   2. serialize base index
-        LOG_KNOWHERE_INFO_ << "Serialize emb_list offset";
+        LOG_KNOWHERE_INFO_ << "Serialize emb_list with strategy: " << emb_list_strategy_->Type();
         try {
-            // serialize emb_list_offset_
-            // 1 * size_t + offset.size() * size_t
-            int64_t total_bytes = (emb_list_offset_->offset.size() + 1) * sizeof(size_t);
-            auto data = std::shared_ptr<uint8_t[]>(new uint8_t[total_bytes]);
-            auto size = emb_list_offset_->offset.size();
-            std::memcpy(data.get(), &size, sizeof(size_t));
-            std::memcpy(data.get() + sizeof(size_t), emb_list_offset_->offset.data(), size * sizeof(size_t));
-            binset.Append(knowhere::meta::EMB_LIST_META, data, total_bytes);
+            // 1. Serialize strategy type
+            auto strategy_type = emb_list_strategy_->Type();
+            size_t type_len = strategy_type.size();
+            auto type_data = std::shared_ptr<uint8_t[]>(new uint8_t[sizeof(size_t) + type_len]);
+            std::memcpy(type_data.get(), &type_len, sizeof(size_t));
+            std::memcpy(type_data.get() + sizeof(size_t), strategy_type.data(), type_len);
+            binset.Append("EMB_LIST_STRATEGY_TYPE", type_data, sizeof(size_t) + type_len);
+
+            // 2. Serialize strategy-specific data
+            RETURN_IF_ERROR(emb_list_strategy_->Serialize(binset));
         } catch (const std::exception& e) {
-            LOG_KNOWHERE_WARNING_ << "serialize emb_list offset error: " << e.what();
+            LOG_KNOWHERE_WARNING_ << "serialize emb_list error: " << e.what();
             return Status::emb_list_inner_error;
         }
+
+        // 3. Serialize base index
         return Serialize(binset);
     }
 
@@ -490,18 +518,12 @@ class IndexNode : public Object {
      */
     virtual Status
     DeserializeEmbListIfNeed(const BinarySet& binset, std::shared_ptr<Config> config) {
-        auto cfg = static_cast<const knowhere::BaseConfig&>(*config);
+        auto& cfg = static_cast<knowhere::BaseConfig&>(*config);
         auto el_metric_type_or = get_el_metric_type(cfg.metric_type.value());
         if (!el_metric_type_or.has_value()) {
-            // if not emb_list, use the default deserialize method
+            // not emb_list, use the default deserialize method
             return Deserialize(binset, config);
         }
-
-        // if is emb_list,
-        //   1. split metric_type into el_metric_type and sub_metric_type
-        //   2. deserialize base index
-        //   2. deserialize emb_list offset
-        //   3. set base index id map
 
         el_metric_type_ = el_metric_type_or.value();
         auto sub_metric_type_or = get_sub_metric_type(cfg.metric_type.value());
@@ -510,32 +532,43 @@ class IndexNode : public Object {
             return Status::emb_list_inner_error;
         }
         cfg.metric_type = sub_metric_type_or.value();
+
+        // Deserialize base index first
         RETURN_IF_ERROR(Deserialize(binset, config));
 
         try {
-            auto binary_ptr = binset.GetByName(knowhere::meta::EMB_LIST_META);
-            if (binary_ptr == nullptr) {
-                LOG_KNOWHERE_INFO_ << "No emb_list offset found, but metric type is emb_list";
-                return Status::emb_list_inner_error;
+            // 1. Read strategy type (default to "direct" for backward compatibility)
+            std::string strategy_type = "direct";
+            auto type_binary = binset.GetByName("EMB_LIST_STRATEGY_TYPE");
+            if (type_binary != nullptr) {
+                size_t type_len = 0;
+                std::memcpy(&type_len, type_binary->data.get(), sizeof(size_t));
+                strategy_type = std::string(reinterpret_cast<char*>(type_binary->data.get() + sizeof(size_t)), type_len);
             }
-            LOG_KNOWHERE_INFO_ << "Deserialize emb_list offset";
-            size_t size = 0;
-            std::memcpy(&size, binary_ptr->data.get(), sizeof(size_t));
-            const auto total_bytes = binary_ptr->size;
-            const auto comp_size = total_bytes / sizeof(size_t) - 1;
-            if (comp_size != size) {
-                LOG_KNOWHERE_WARNING_ << "the computed size of emb_list offset is not equal to size from binary set";
-                return Status::emb_list_inner_error;
+
+            // 2. Create strategy
+            auto strategy_or = CreateEmbListStrategy(strategy_type, cfg);
+            if (!strategy_or.has_value()) {
+                LOG_KNOWHERE_WARNING_ << "Failed to create emb_list strategy: " << strategy_type;
+                return strategy_or.error();
             }
-            std::vector<size_t> offset(size);
-            std::memcpy(offset.data(), binary_ptr->data.get() + sizeof(size_t), size * sizeof(size_t));
-            emb_list_offset_ = std::make_unique<EmbListOffset>(std::move(offset));
+            emb_list_strategy_ = std::move(strategy_or.value());
+
+            // 3. Deserialize strategy-specific data
+            LOG_KNOWHERE_INFO_ << "Deserialize emb_list with strategy: " << strategy_type;
+            RETURN_IF_ERROR(emb_list_strategy_->Deserialize(binset, cfg));
+
+            // 4. Set ID mapping if needed
+            if (emb_list_strategy_->NeedsBaseIndexIDMap()) {
+                emb_list_offset_ = emb_list_strategy_->GetEmbListOffset();
+                return SetBaseIndexIDMap();
+            }
         } catch (const std::exception& e) {
-            LOG_KNOWHERE_WARNING_ << "deserialize emb_list offset error: " << e.what();
+            LOG_KNOWHERE_WARNING_ << "deserialize emb_list error: " << e.what();
             return Status::emb_list_inner_error;
         }
 
-        return SetBaseIndexIDMap();
+        return Status::success;
     }
 
     virtual bool
@@ -548,18 +581,12 @@ class IndexNode : public Object {
 
     virtual Status
     DeserializeFromFileIfNeed(const std::string& filename, std::shared_ptr<Config> config) {
-        auto cfg = static_cast<const knowhere::BaseConfig&>(*config);
+        auto& cfg = static_cast<knowhere::BaseConfig&>(*config);
         auto el_metric_type_or = get_el_metric_type(cfg.metric_type.value());
         if (!el_metric_type_or.has_value()) {
-            // if not emb_list, use the default deserialize method
+            // not emb_list, use the default deserialize method
             return DeserializeFromFile(filename, config);
         }
-
-        // if is emb_list,
-        //   1. split metric_type into el_metric_type and sub_metric_type
-        //   2. deserialize base index
-        //   3. deserialize emb_list offset
-        //   4. set base index id map
 
         el_metric_type_ = el_metric_type_or.value();
         auto sub_metric_type_or = get_sub_metric_type(cfg.metric_type.value());
@@ -568,9 +595,12 @@ class IndexNode : public Object {
             return Status::emb_list_inner_error;
         }
         cfg.metric_type = sub_metric_type_or.value();
+
+        // Deserialize base index first
         RETURN_IF_ERROR(DeserializeFromFile(filename, config));
 
         try {
+            // Read emb_list offset from separate meta file
             auto emb_list_meta_file_path = cfg.emb_list_meta_file_path.value();
             if (emb_list_meta_file_path.empty()) {
                 LOG_KNOWHERE_WARNING_ << "emb_list_meta_file is empty, but metric type is emb_list";
@@ -588,13 +618,38 @@ class IndexNode : public Object {
             std::memcpy(&size, size_buffer, sizeof(size_t));
             std::vector<size_t> offset(size);
             emb_list_meta_file.read(reinterpret_cast<char*>(offset.data()), size * sizeof(size_t));
-            emb_list_offset_ = std::make_unique<EmbListOffset>(std::move(offset));
+
+            // Create strategy (currently only direct strategy supports file-based deserialization)
+            auto strategy_type = cfg.emb_list_strategy.value_or("direct");
+            auto strategy_or = CreateEmbListStrategy(strategy_type, cfg);
+            if (!strategy_or.has_value()) {
+                LOG_KNOWHERE_WARNING_ << "Failed to create emb_list strategy: " << strategy_type;
+                return strategy_or.error();
+            }
+            emb_list_strategy_ = std::move(strategy_or.value());
+
+            // For file-based loading, we need to manually set up the offset
+            // by creating a BinarySet with the offset data and calling Deserialize
+            BinarySet temp_binset;
+            size_t num_offsets = offset.size();
+            size_t total_bytes = sizeof(size_t) + num_offsets * sizeof(size_t);
+            auto data = std::shared_ptr<uint8_t[]>(new uint8_t[total_bytes]);
+            std::memcpy(data.get(), &num_offsets, sizeof(size_t));
+            std::memcpy(data.get() + sizeof(size_t), offset.data(), num_offsets * sizeof(size_t));
+            temp_binset.Append(knowhere::meta::EMB_LIST_META, data, total_bytes);
+            RETURN_IF_ERROR(emb_list_strategy_->Deserialize(temp_binset, cfg));
+
+            // Set ID mapping if needed
+            if (emb_list_strategy_->NeedsBaseIndexIDMap()) {
+                emb_list_offset_ = emb_list_strategy_->GetEmbListOffset();
+                return SetBaseIndexIDMap();
+            }
         } catch (const std::exception& e) {
             LOG_KNOWHERE_WARNING_ << "deserialize emb_list offset error: " << e.what();
             return Status::emb_list_inner_error;
         }
 
-        return SetBaseIndexIDMap();
+        return Status::success;
     }
 
     virtual expected<DataSetPtr>
@@ -645,8 +700,9 @@ class IndexNode : public Object {
 
  protected:
     Version version_;
-    std::unique_ptr<EmbListOffset> emb_list_offset_;  // emb_list group offset structure
+    std::shared_ptr<EmbListOffset> emb_list_offset_;  // emb_list group offset structure (shared with strategy)
     std::string el_metric_type_;
+    EmbListStrategyPtr emb_list_strategy_;  // emb_list encoding strategy (direct/muvera)
 };
 
 // Common superclass for iterators that expand search range as needed. Subclasses need
