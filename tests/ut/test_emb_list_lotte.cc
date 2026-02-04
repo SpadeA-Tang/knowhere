@@ -40,9 +40,9 @@ constexpr int32_t MAX_DOCS_TO_LOAD = 10000;   // Hard-coded limit on documents
 constexpr int32_t MAX_QUERIES_TO_LOAD = 100;  // Hard-coded limit on queries
 constexpr bool SKIP_DIRECT_TEST = false;      // Set to true to skip Direct strategy (it's slow)
 
-// MS MARCO data file paths (with official ground truth annotations)
-const std::string MSMARCO_DOCS_JSONL_PATH = "msmarco_gt_docs.jsonl";
-const std::string MSMARCO_QUERIES_JSONL_PATH = "msmarco_gt_queries.jsonl";
+// LoTTE data file paths (with official ground truth annotations)
+const std::string LOTTE_DOCS_JSONL_PATH = "lotte_science_gt_docs.jsonl";
+const std::string LOTTE_QUERIES_JSONL_PATH = "lotte_science_gt_queries.jsonl";
 
 // ============================================================================
 // EmbListData: Load and manage embedding list data
@@ -55,6 +55,8 @@ struct EmbListData {
     int64_t num_docs = 0;
     int64_t total_vectors = 0;
 
+    // Load from JSONL file format
+    // Each line: {"pid": int, "text": str, "chunks": [{"pos": int, "emb": [float, ...]}, ...]}
     bool
     LoadFromJsonl(const std::string& jsonl_path, int32_t max_docs) {
         std::ifstream file(jsonl_path);
@@ -123,6 +125,7 @@ struct EmbListData {
         return ds;
     }
 
+    // Print statistics about vector counts per document
     void
     PrintStats() const {
         if (num_docs == 0)
@@ -266,37 +269,37 @@ struct QueryDataWithGT {
 
 }  // namespace
 
-TEST_CASE("MS MARCO ColBERT: Direct vs MUVERA", "[msmarco_emb_list]") {
-    // Check if MS MARCO data files exist
+TEST_CASE("LoTTE ColBERT: Direct vs MUVERA", "[lotte_emb_list]") {
+    // Check if LoTTE data files exist
     {
-        std::ifstream docs_file(MSMARCO_DOCS_JSONL_PATH);
-        std::ifstream queries_file(MSMARCO_QUERIES_JSONL_PATH);
+        std::ifstream docs_file(LOTTE_DOCS_JSONL_PATH);
+        std::ifstream queries_file(LOTTE_QUERIES_JSONL_PATH);
 
         if (!docs_file.good() || !queries_file.good()) {
             printf("\n");
             printf("=============================================================\n");
-            printf("MS MARCO data files not found. Please prepare the data first.\n");
+            printf("LoTTE data files not found. Please prepare the data first.\n");
             printf("Expected files:\n");
-            printf("  - %s\n", MSMARCO_DOCS_JSONL_PATH.c_str());
-            printf("  - %s\n", MSMARCO_QUERIES_JSONL_PATH.c_str());
+            printf("  - %s\n", LOTTE_DOCS_JSONL_PATH.c_str());
+            printf("  - %s\n", LOTTE_QUERIES_JSONL_PATH.c_str());
             printf("\n");
-            printf("Generate MS MARCO data with GT annotations:\n");
-            printf("  python scripts/prepare_msmarco_with_gt.py --output-dir .\n");
+            printf("Generate LoTTE data with GT annotations:\n");
+            printf("  python scripts/prepare_lotte_with_gt.py --domain science --output-dir .\n");
             printf("=============================================================\n");
-            SKIP("MS MARCO data files not found");
+            SKIP("LoTTE data files not found");
             return;
         }
     }
 
     // Load data
-    printf("\n=== Loading MS MARCO Data (with GT annotations) ===\n");
+    printf("\n=== Loading LoTTE Science Data (with GT annotations) ===\n");
     EmbListData doc_data;
     QueryDataWithGT query_data;
 
-    REQUIRE(doc_data.LoadFromJsonl(MSMARCO_DOCS_JSONL_PATH, MAX_DOCS_TO_LOAD));
+    REQUIRE(doc_data.LoadFromJsonl(LOTTE_DOCS_JSONL_PATH, MAX_DOCS_TO_LOAD));
     doc_data.PrintStats();
 
-    REQUIRE(query_data.LoadFromJsonl(MSMARCO_QUERIES_JSONL_PATH, MAX_QUERIES_TO_LOAD));
+    REQUIRE(query_data.LoadFromJsonl(LOTTE_QUERIES_JSONL_PATH, MAX_QUERIES_TO_LOAD));
     query_data.PrintStats();
 
     auto doc_ds = doc_data.ToDataSet();
@@ -332,8 +335,66 @@ TEST_CASE("MS MARCO ColBERT: Direct vs MUVERA", "[msmarco_emb_list]") {
     auto version = GenTestEmbListVersionList();
 
     // ========== Official Ground Truth ==========
-    printf("\n[Ground Truth] Using official MS MARCO annotations (gt_pids)\n");
+    printf("\n[Ground Truth] Using official LoTTE annotations (gt_pids)\n");
     fflush(stdout);
+
+    // Analyze ground truth document lengths
+    printf("[Ground Truth] Analyzing annotated GT document lengths...\n");
+    {
+        std::vector<int64_t> gt_doc_lengths;
+        std::map<std::string, int> length_buckets;
+        length_buckets["1-50"] = 0;
+        length_buckets["51-100"] = 0;
+        length_buckets["101-200"] = 0;
+        length_buckets["201-500"] = 0;
+        length_buckets["501-1000"] = 0;
+        length_buckets["1001+"] = 0;
+
+        for (int q = 0; q < num_queries; ++q) {
+            for (int64_t doc_id : query_data.gt_pids[q]) {
+                if (doc_id >= 0 && doc_id < num_docs) {
+                    int64_t doc_len = doc_data.offsets[doc_id + 1] - doc_data.offsets[doc_id];
+                    gt_doc_lengths.push_back(doc_len);
+
+                    if (doc_len <= 50)
+                        length_buckets["1-50"]++;
+                    else if (doc_len <= 100)
+                        length_buckets["51-100"]++;
+                    else if (doc_len <= 200)
+                        length_buckets["101-200"]++;
+                    else if (doc_len <= 500)
+                        length_buckets["201-500"]++;
+                    else if (doc_len <= 1000)
+                        length_buckets["501-1000"]++;
+                    else
+                        length_buckets["1001+"]++;
+                }
+            }
+        }
+
+        if (!gt_doc_lengths.empty()) {
+            std::sort(gt_doc_lengths.begin(), gt_doc_lengths.end());
+            int64_t min_len = gt_doc_lengths.front();
+            int64_t max_len = gt_doc_lengths.back();
+            int64_t median_len = gt_doc_lengths[gt_doc_lengths.size() / 2];
+            double avg_len = 0;
+            for (auto len : gt_doc_lengths) avg_len += len;
+            avg_len /= gt_doc_lengths.size();
+
+            printf("[Ground Truth] GT doc length stats: min=%ld, max=%ld, avg=%.1f, median=%ld\n", min_len, max_len,
+                   avg_len, median_len);
+            printf("[Ground Truth] GT doc length distribution:\n");
+            int total = gt_doc_lengths.size();
+            printf("    1-50:    %5d (%.1f%%)\n", length_buckets["1-50"], 100.0 * length_buckets["1-50"] / total);
+            printf("   51-100:   %5d (%.1f%%)\n", length_buckets["51-100"], 100.0 * length_buckets["51-100"] / total);
+            printf("  101-200:   %5d (%.1f%%)\n", length_buckets["101-200"], 100.0 * length_buckets["101-200"] / total);
+            printf("  201-500:   %5d (%.1f%%)\n", length_buckets["201-500"], 100.0 * length_buckets["201-500"] / total);
+            printf("  501-1000:  %5d (%.1f%%)\n", length_buckets["501-1000"],
+                   100.0 * length_buckets["501-1000"] / total);
+            printf("  1001+:     %5d (%.1f%%)\n", length_buckets["1001+"], 100.0 * length_buckets["1001+"] / total);
+        }
+        fflush(stdout);
+    }
 
     // Recall calculation based on official GT annotations (per-query average)
     auto calc_recall_vs_gt = [&](const int64_t* result_ids, int32_t k) {
@@ -473,8 +534,8 @@ TEST_CASE("MS MARCO ColBERT: Direct vs MUVERA", "[msmarco_emb_list]") {
     // ========== MUVERA Strategy with Multiple Parameter Combinations ==========
     // Define parameter combinations: (num_projections, num_repeats)
     std::vector<std::pair<int32_t, int32_t>> muvera_params = {
-        {2, 3}, {2, 5}, {2, 7}, {3, 3}, {3, 5}, {3, 7}, {4, 3}, {4, 5},
-        {4, 7}, {5, 3}, {5, 5}, {5, 7}, {6, 3}, {6, 5}, {6, 7},
+        {2, 3}, {2, 5}, {2, 7}, {3, 3}, {3, 5}, {3, 7}, {4, 3}, {4, 5}, {4, 7}, {5, 3}, {5, 5}, {5, 7},
+        {6, 3}, {6, 5}, {6, 7},
     };
 
     // Store results for each combination
@@ -538,7 +599,7 @@ TEST_CASE("MS MARCO ColBERT: Direct vs MUVERA", "[msmarco_emb_list]") {
 
     // ========== Summary ==========
     printf("\n============================================================================================\n");
-    printf("                              Summary (MS MARCO)                                            \n");
+    printf("                              Summary (LoTTE Science)                                       \n");
     printf("============================================================================================\n");
 
     // Header with topk columns

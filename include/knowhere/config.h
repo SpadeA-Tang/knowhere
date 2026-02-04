@@ -646,6 +646,14 @@ class BaseConfig : public Config {
     CFG_INT muvera_seed;                   // random seed for SimHash projection matrices
     CFG_BOOL muvera_store_raw_data;        // store raw data for reranking
     CFG_BOOL muvera_rerank;                // whether to perform MaxSim reranking (trade recall for latency)
+    // LEMUR config
+    CFG_INT lemur_hidden_dim;              // hidden dimension for LEMUR MLP (compressed representation)
+    CFG_INT lemur_num_train_samples;       // number of training samples for MLP
+    CFG_INT lemur_num_epochs;              // number of training epochs
+    CFG_INT lemur_batch_size;              // batch size for MLP training
+    CFG_FLOAT lemur_learning_rate;         // learning rate for MLP training
+    CFG_INT lemur_seed;                    // random seed for LEMUR
+    CFG_BOOL lemur_rerank;                 // whether to perform MaxSim reranking
     KNOHWERE_DECLARE_CONFIG(BaseConfig) {
         KNOWHERE_CONFIG_DECLARE_FIELD(dim).allow_empty_without_default().description("vector dim").for_train();
         KNOWHERE_CONFIG_DECLARE_FIELD(metric_type)
@@ -843,6 +851,40 @@ class BaseConfig : public Config {
             .for_train();
         KNOWHERE_CONFIG_DECLARE_FIELD(muvera_rerank)
             .description("Whether to perform MaxSim reranking after ANN search (false = trade recall for latency)")
+            .set_default(true)
+            .for_search();
+        // LEMUR config
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_hidden_dim)
+            .description("Hidden dimension for LEMUR MLP (compressed representation dimension)")
+            .set_default(256)
+            .set_range(32, 4096)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_num_train_samples)
+            .description("Number of training samples for LEMUR MLP")
+            .set_default(10000)
+            .set_range(100, 1000000)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_num_epochs)
+            .description("Number of training epochs for LEMUR MLP")
+            .set_default(50)
+            .set_range(1, 1000)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_batch_size)
+            .description("Batch size for LEMUR MLP training")
+            .set_default(64)
+            .set_range(1, 4096)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_learning_rate)
+            .description("Learning rate for LEMUR MLP training")
+            .set_default(0.001f)
+            .set_range(0.00001f, 1.0f)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_seed)
+            .description("Random seed for LEMUR")
+            .set_default(42)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_rerank)
+            .description("Whether to perform MaxSim reranking after ANN search")
             .set_default(true)
             .for_search();
     }

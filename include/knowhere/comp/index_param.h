@@ -120,6 +120,12 @@ constexpr const char* EMB_LIST_OFFSET = "EMB_LIST_OFFSET";
 // muvera meta
 constexpr const char* MUVERA_CONFIG = "MUVERA_CONFIG";
 constexpr const char* MUVERA_RAW_DATA = "MUVERA_RAW_DATA";
+
+// lemur meta
+constexpr const char* LEMUR_CONFIG = "LEMUR_CONFIG";
+constexpr const char* LEMUR_MLP = "LEMUR_MLP";
+constexpr const char* LEMUR_RAW_DATA = "LEMUR_RAW_DATA";
+constexpr const char* LEMUR_W = "LEMUR_W";
 };  // namespace meta
 
 namespace indexparam {

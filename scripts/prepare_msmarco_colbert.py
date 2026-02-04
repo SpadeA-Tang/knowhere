@@ -3,18 +3,15 @@
 Prepare MS MARCO ColBERT embeddings for knowhere testing.
 
 Usage:
-    # Download pre-computed ColBERT embeddings (recommended)
-    python scripts/prepare_msmarco_colbert.py --download --max-docs 100000
+    # Encode real MS MARCO data with ColBERT (requires GPU)
+    python scripts/prepare_msmarco_colbert.py --max-docs 10000 --max-queries 100
 
-    # Generate synthetic data (for quick testing)
-    python scripts/prepare_msmarco_colbert.py --synthetic --max-docs 100000
+    # Generate synthetic data (for quick testing, no GPU needed)
+    python scripts/prepare_msmarco_colbert.py --synthetic --max-docs 10000
 
-Requirements for --download:
-    pip install torch numpy tqdm requests
-
-Binary output format:
-    vectors.bin: [int32 dim][int64 total_vectors][float32 * dim * total_vectors]
-    offsets.bin: [int64 num_docs][size_t * (num_docs + 1)]
+Requirements:
+    pip install torch --index-url https://download.pytorch.org/whl/cu118
+    pip install colbert-ai transformers datasets tqdm numpy
 """
 
 import argparse
@@ -24,8 +21,8 @@ import numpy as np
 from pathlib import Path
 
 DEFAULT_MAX_DOCS = 10000
-DEFAULT_MAX_QUERIES = 1000
-DEFAULT_OUTPUT_DIR = "build/Release"
+DEFAULT_MAX_QUERIES = 100
+DEFAULT_OUTPUT_DIR = "."
 
 
 def save_emb_list_binary(vectors: np.ndarray, offsets: np.ndarray,
@@ -49,91 +46,123 @@ def save_emb_list_binary(vectors: np.ndarray, offsets: np.ndarray,
     print(f"  offsets: {offsets_path} ({os.path.getsize(offsets_path) / 1e3:.1f} KB)")
 
 
-def download_precomputed_colbert(output_dir: Path, max_docs: int, max_queries: int):
-    """
-    Download pre-computed ColBERT v2 embeddings from official source.
-
-    The embeddings are stored in a packed format where each passage has variable
-    number of token embeddings (128-dim each).
-    """
+def encode_with_colbert(texts: list, checkpoint, is_query: bool = False, batch_size: int = 32):
+    """Encode texts using ColBERT model."""
     import torch
-    import requests
     from tqdm import tqdm
 
-    # ColBERT v2 pre-computed embeddings URLs
-    # These are from the official ColBERT repository
-    base_url = "https://huggingface.co/colbert-ir/colbertv2.0_msmarco_passage/resolve/main"
+    all_embeddings = []
+    offsets = [0]
 
-    cache_dir = output_dir / "colbert_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    for i in tqdm(range(0, len(texts), batch_size), desc="Encoding"):
+        batch = texts[i:i+batch_size]
+        with torch.no_grad():
+            if is_query:
+                embs = checkpoint.queryFromText(batch)
+            else:
+                embs = checkpoint.docFromText(batch)
 
-    def download_file(url, local_path):
-        if local_path.exists():
-            print(f"Using cached: {local_path}")
-            return
-        print(f"Downloading: {url}")
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        total = int(response.headers.get('content-length', 0))
-        with open(local_path, 'wb') as f:
-            with tqdm(total=total, unit='B', unit_scale=True) as pbar:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                    pbar.update(len(chunk))
+            # embs shape: [batch_size, max_len, dim]
+            # Each text has different actual length (non-padding)
+            for emb in embs:
+                # Remove padding (zero vectors or very small norm)
+                norms = torch.norm(emb, dim=-1)
+                mask = norms > 1e-6
+                valid_emb = emb[mask].cpu().numpy()
 
-    # Try to download from HuggingFace datasets with pre-computed embeddings
+                if len(valid_emb) == 0:
+                    # Fallback: use at least one vector
+                    valid_emb = emb[0:1].cpu().numpy()
+
+                all_embeddings.append(valid_emb)
+                offsets.append(offsets[-1] + len(valid_emb))
+
+    vectors = np.vstack(all_embeddings).astype(np.float32)
+    offsets = np.array(offsets, dtype=np.uint64)
+
+    return vectors, offsets
+
+
+def download_and_encode_msmarco(max_docs: int, max_queries: int, output_dir: Path):
+    """Download MS MARCO and encode with ColBERT."""
+    import torch
+    from datasets import load_dataset
+
+    # Check CUDA
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+    # Load ColBERT model
+    print("\n=== Loading ColBERT model ===")
+    from colbert.infra import ColBERTConfig
+    from colbert.modeling.checkpoint import Checkpoint
+
+    config = ColBERTConfig(
+        doc_maxlen=180,
+        query_maxlen=32,
+    )
+    checkpoint = Checkpoint("colbert-ir/colbertv2.0", colbert_config=config)
+    print("ColBERT model loaded successfully")
+
+    # Download MS MARCO passages
+    print(f"\n=== Downloading MS MARCO passages (first {max_docs}) ===")
     try:
-        from datasets import load_dataset
-        print("Loading pre-computed ColBERT embeddings from HuggingFace...")
-
-        # This dataset contains pre-computed ColBERT embeddings
-        # Format: each example has 'embeddings' (list of 128-dim vectors) and 'doc_id'
-        dataset = load_dataset(
-            "colbert-ir/colbertv2.0_msmarco_passage",
-            split="train",
-            streaming=True  # Stream to avoid loading all into memory
-        )
-
-        all_vectors = []
-        offsets = [0]
-        doc_count = 0
-
-        print(f"Processing up to {max_docs} documents...")
-        for example in tqdm(dataset, total=max_docs):
-            if doc_count >= max_docs:
+        # Try the Tevatron corpus first (cleaner format)
+        corpus = load_dataset("Tevatron/msmarco-passage-corpus", split="train", streaming=True)
+        passages = []
+        for i, item in enumerate(corpus):
+            if i >= max_docs:
                 break
-
-            # Each example has token embeddings
-            embs = np.array(example['embeddings'], dtype=np.float32)
-            all_vectors.append(embs)
-            offsets.append(offsets[-1] + len(embs))
-            doc_count += 1
-
-        doc_vectors = np.vstack(all_vectors)
-        doc_offsets = np.array(offsets, dtype=np.uint64)
-
-        print(f"Loaded {doc_count} documents, {len(doc_vectors)} vectors")
-        return doc_vectors, doc_offsets, None, None
-
+            passages.append(item['text'])
+            if (i + 1) % 1000 == 0:
+                print(f"  Loaded {i + 1} passages...")
+        print(f"Loaded {len(passages)} passages")
     except Exception as e:
-        print(f"HuggingFace loading failed: {e}")
-        print("Falling back to alternative method...")
+        print(f"Tevatron dataset failed: {e}")
+        print("Trying microsoft/ms_marco...")
+        corpus = load_dataset("microsoft/ms_marco", "v1.1", split="train", streaming=True)
+        passages = []
+        for i, item in enumerate(corpus):
+            if i >= max_docs:
+                break
+            # ms_marco format has passages in a different structure
+            if 'passages' in item:
+                for p in item['passages']['passage_text']:
+                    passages.append(p)
+                    if len(passages) >= max_docs:
+                        break
+            if len(passages) >= max_docs:
+                break
+        passages = passages[:max_docs]
+        print(f"Loaded {len(passages)} passages")
 
-    # Alternative: Download raw embeddings files
-    # ColBERT stores embeddings in .pt files
+    # Encode passages
+    print(f"\n=== Encoding {len(passages)} passages with ColBERT ===")
+    doc_vectors, doc_offsets = encode_with_colbert(passages, checkpoint, is_query=False, batch_size=32)
+
+    # Download queries
+    print(f"\n=== Downloading MS MARCO queries (first {max_queries}) ===")
     try:
-        print("\nTrying alternative download method...")
-
-        # Download a sample of pre-computed embeddings
-        # These URLs point to smaller samples for testing
-        sample_url = "https://public.ukp.informatik.tu-darmstadt.de/kwang/colbert/colbertv2_msmarco_embeddings_sample.tar.gz"
-
-        # For now, fall back to synthetic if download fails
-        raise NotImplementedError("Alternative download not implemented yet")
-
+        queries_ds = load_dataset("Tevatron/msmarco-passage", split="dev", streaming=True)
+        queries = []
+        for i, item in enumerate(queries_ds):
+            if i >= max_queries:
+                break
+            queries.append(item['query'])
+        print(f"Loaded {len(queries)} queries")
     except Exception as e:
-        print(f"Alternative download failed: {e}")
-        return None, None, None, None
+        print(f"Query dataset failed: {e}, using passage prefixes as queries")
+        queries = [p[:100] for p in passages[:max_queries]]
+        print(f"Generated {len(queries)} synthetic queries from passages")
+
+    # Encode queries
+    print(f"\n=== Encoding {len(queries)} queries with ColBERT ===")
+    query_vectors, query_offsets = encode_with_colbert(queries, checkpoint, is_query=True, batch_size=32)
+
+    return doc_vectors, doc_offsets, query_vectors, query_offsets
 
 
 def generate_synthetic_data(max_docs, max_queries, dim=128):
@@ -177,96 +206,18 @@ def generate_synthetic_data(max_docs, max_queries, dim=128):
     return doc_vectors, doc_offsets, query_vectors, query_offsets
 
 
-def load_beir_with_colbert(dataset_name: str, max_docs: int, max_queries: int):
-    """
-    Load a BEIR dataset and encode with ColBERT.
-    Smaller datasets like SciFact, NFCorpus are quick to encode.
-    """
-    try:
-        from colbert.infra import ColBERTConfig
-        from colbert.modeling.checkpoint import Checkpoint
-        from beir import util
-        from beir.datasets.data_loader import GenericDataLoader
-
-        print(f"Loading BEIR dataset: {dataset_name}")
-
-        # Download dataset
-        url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset_name}.zip"
-        data_path = util.download_and_unzip(url, "datasets")
-
-        # Load corpus and queries
-        corpus, queries, qrels = GenericDataLoader(data_path).load(split="test")
-
-        print(f"Corpus size: {len(corpus)}, Queries: {len(queries)}")
-
-        # Initialize ColBERT
-        config = ColBERTConfig(doc_maxlen=180, query_maxlen=32)
-        checkpoint = Checkpoint("colbert-ir/colbertv2.0", colbert_config=config)
-
-        # Encode documents
-        doc_texts = [corpus[doc_id]['text'] for doc_id in list(corpus.keys())[:max_docs]]
-        # ... encoding logic
-
-        return None  # TODO: implement full encoding
-
-    except ImportError as e:
-        print(f"BEIR/ColBERT not available: {e}")
-        return None
-
-
-def download_from_huggingface_embeddings(max_docs: int, max_queries: int):
-    """
-    Download pre-computed embeddings from HuggingFace.
-    Several researchers have uploaded ColBERT embeddings.
-    """
-    try:
-        from datasets import load_dataset
-        import torch
-
-        print("Searching for pre-computed ColBERT embeddings on HuggingFace...")
-
-        # Try known datasets with pre-computed embeddings
-        # Option 1: answerdotai/msmarco-passage-embeddings (if available)
-        # Option 2: Other community uploads
-
-        # For MS MARCO, we can try loading from various sources
-        datasets_to_try = [
-            ("Tevatron/msmarco-passage-corpus", "train"),
-            ("sentence-transformers/msmarco-hard-negatives", "train"),
-        ]
-
-        for dataset_name, split in datasets_to_try:
-            try:
-                print(f"Trying: {dataset_name}")
-                ds = load_dataset(dataset_name, split=split, streaming=True)
-                sample = next(iter(ds))
-                print(f"  Fields: {sample.keys()}")
-                if 'embeddings' in sample or 'embedding' in sample:
-                    print(f"  Found embeddings!")
-                    # Process this dataset
-                    break
-            except Exception as e:
-                print(f"  Failed: {e}")
-                continue
-
-        return None, None, None, None
-
-    except Exception as e:
-        print(f"HuggingFace download failed: {e}")
-        return None, None, None, None
-
-
 def main():
     parser = argparse.ArgumentParser(description="Prepare MS MARCO ColBERT data")
-    parser.add_argument("--max-docs", type=int, default=DEFAULT_MAX_DOCS)
-    parser.add_argument("--max-queries", type=int, default=DEFAULT_MAX_QUERIES)
-    parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--max-docs", type=int, default=DEFAULT_MAX_DOCS,
+                        help=f"Maximum documents to encode (default: {DEFAULT_MAX_DOCS})")
+    parser.add_argument("--max-queries", type=int, default=DEFAULT_MAX_QUERIES,
+                        help=f"Maximum queries to encode (default: {DEFAULT_MAX_QUERIES})")
+    parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR,
+                        help=f"Output directory (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--synthetic", action="store_true",
-                        help="Generate synthetic data (fast, no download)")
-    parser.add_argument("--download", action="store_true",
-                        help="Download pre-computed ColBERT embeddings")
+                        help="Generate synthetic data instead of real ColBERT embeddings")
     parser.add_argument("--dim", type=int, default=128,
-                        help="Dimension for synthetic data")
+                        help="Dimension for synthetic data (default: 128)")
 
     args = parser.parse_args()
 
@@ -278,35 +229,13 @@ def main():
     query_vectors_path = output_dir / "msmarco_query_vectors.bin"
     query_offsets_path = output_dir / "msmarco_query_offsets.bin"
 
-    doc_vectors, doc_offsets, query_vectors, query_offsets = None, None, None, None
-
     if args.synthetic:
         doc_vectors, doc_offsets, query_vectors, query_offsets = generate_synthetic_data(
             args.max_docs, args.max_queries, args.dim
         )
-    elif args.download:
-        result = download_precomputed_colbert(output_dir, args.max_docs, args.max_queries)
-        if result[0] is not None:
-            doc_vectors, doc_offsets, query_vectors, query_offsets = result
-        else:
-            print("\nPre-computed embeddings not available.")
-            print("Falling back to synthetic data...")
-            doc_vectors, doc_offsets, query_vectors, query_offsets = generate_synthetic_data(
-                args.max_docs, args.max_queries, args.dim
-            )
     else:
-        # Default: try download, fallback to synthetic
-        print("No mode specified. Use --synthetic or --download")
-        print("Generating synthetic data by default...")
-        doc_vectors, doc_offsets, query_vectors, query_offsets = generate_synthetic_data(
-            args.max_docs, args.max_queries, args.dim
-        )
-
-    # If we only got documents (no queries), generate synthetic queries
-    if query_vectors is None:
-        print("\nGenerating synthetic queries...")
-        _, _, query_vectors, query_offsets = generate_synthetic_data(
-            100, args.max_queries, doc_vectors.shape[1] if doc_vectors is not None else args.dim
+        doc_vectors, doc_offsets, query_vectors, query_offsets = download_and_encode_msmarco(
+            args.max_docs, args.max_queries, output_dir
         )
 
     # Save to binary files
@@ -327,6 +256,7 @@ def main():
     print(f"  Total vectors: {doc_offsets[-1]}")
     print(f"  Vectors per doc: min={doc_counts.min()}, max={doc_counts.max()}, "
           f"avg={doc_counts.mean():.1f}, median={np.median(doc_counts):.0f}")
+    print(f"  Dimension: {doc_vectors.shape[1]}")
 
     num_queries = len(query_offsets) - 1
     query_counts = np.diff(query_offsets)

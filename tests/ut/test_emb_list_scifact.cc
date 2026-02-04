@@ -36,13 +36,13 @@ namespace {
 // ============================================================================
 // Configuration: Control test behavior
 // ============================================================================
-constexpr int32_t MAX_DOCS_TO_LOAD = 10000;   // Hard-coded limit on documents
+constexpr int32_t MAX_DOCS_TO_LOAD = 6000;    // SciFact has ~5183 docs
 constexpr int32_t MAX_QUERIES_TO_LOAD = 100;  // Hard-coded limit on queries
 constexpr bool SKIP_DIRECT_TEST = false;      // Set to true to skip Direct strategy (it's slow)
 
-// MS MARCO data file paths (with official ground truth annotations)
-const std::string MSMARCO_DOCS_JSONL_PATH = "msmarco_gt_docs.jsonl";
-const std::string MSMARCO_QUERIES_JSONL_PATH = "msmarco_gt_queries.jsonl";
+// SciFact data file paths (with official ground truth annotations)
+const std::string SCIFACT_DOCS_JSONL_PATH = "scifact_gt_docs.jsonl";
+const std::string SCIFACT_QUERIES_JSONL_PATH = "scifact_gt_queries.jsonl";
 
 // ============================================================================
 // EmbListData: Load and manage embedding list data
@@ -141,9 +141,10 @@ struct EmbListData {
         std::sort(counts.begin(), counts.end());
         double avg_count = (double)sum_count / num_docs;
         int64_t median_count = counts[num_docs / 2];
+        int64_t p90_count = counts[(int64_t)(num_docs * 0.9)];
 
-        printf("Vectors per doc: min=%ld, max=%ld, avg=%.1f, median=%ld\n", min_count, max_count, avg_count,
-               median_count);
+        printf("Vectors per doc: min=%ld, max=%ld, avg=%.1f, median=%ld, P90=%ld\n", min_count, max_count, avg_count,
+               median_count, p90_count);
     }
 };
 
@@ -266,37 +267,37 @@ struct QueryDataWithGT {
 
 }  // namespace
 
-TEST_CASE("MS MARCO ColBERT: Direct vs MUVERA", "[msmarco_emb_list]") {
-    // Check if MS MARCO data files exist
+TEST_CASE("SciFact ColBERT: Direct vs MUVERA", "[scifact_emb_list]") {
+    // Check if SciFact data files exist
     {
-        std::ifstream docs_file(MSMARCO_DOCS_JSONL_PATH);
-        std::ifstream queries_file(MSMARCO_QUERIES_JSONL_PATH);
+        std::ifstream docs_file(SCIFACT_DOCS_JSONL_PATH);
+        std::ifstream queries_file(SCIFACT_QUERIES_JSONL_PATH);
 
         if (!docs_file.good() || !queries_file.good()) {
             printf("\n");
             printf("=============================================================\n");
-            printf("MS MARCO data files not found. Please prepare the data first.\n");
+            printf("SciFact data files not found. Please prepare the data first.\n");
             printf("Expected files:\n");
-            printf("  - %s\n", MSMARCO_DOCS_JSONL_PATH.c_str());
-            printf("  - %s\n", MSMARCO_QUERIES_JSONL_PATH.c_str());
+            printf("  - %s\n", SCIFACT_DOCS_JSONL_PATH.c_str());
+            printf("  - %s\n", SCIFACT_QUERIES_JSONL_PATH.c_str());
             printf("\n");
-            printf("Generate MS MARCO data with GT annotations:\n");
-            printf("  python scripts/prepare_msmarco_with_gt.py --output-dir .\n");
+            printf("Generate SciFact data with GT annotations:\n");
+            printf("  python scripts/prepare_scifact_with_gt.py --output-dir .\n");
             printf("=============================================================\n");
-            SKIP("MS MARCO data files not found");
+            SKIP("SciFact data files not found");
             return;
         }
     }
 
     // Load data
-    printf("\n=== Loading MS MARCO Data (with GT annotations) ===\n");
+    printf("\n=== Loading SciFact Data (with GT annotations) ===\n");
     EmbListData doc_data;
     QueryDataWithGT query_data;
 
-    REQUIRE(doc_data.LoadFromJsonl(MSMARCO_DOCS_JSONL_PATH, MAX_DOCS_TO_LOAD));
+    REQUIRE(doc_data.LoadFromJsonl(SCIFACT_DOCS_JSONL_PATH, MAX_DOCS_TO_LOAD));
     doc_data.PrintStats();
 
-    REQUIRE(query_data.LoadFromJsonl(MSMARCO_QUERIES_JSONL_PATH, MAX_QUERIES_TO_LOAD));
+    REQUIRE(query_data.LoadFromJsonl(SCIFACT_QUERIES_JSONL_PATH, MAX_QUERIES_TO_LOAD));
     query_data.PrintStats();
 
     auto doc_ds = doc_data.ToDataSet();
@@ -332,7 +333,7 @@ TEST_CASE("MS MARCO ColBERT: Direct vs MUVERA", "[msmarco_emb_list]") {
     auto version = GenTestEmbListVersionList();
 
     // ========== Official Ground Truth ==========
-    printf("\n[Ground Truth] Using official MS MARCO annotations (gt_pids)\n");
+    printf("\n[Ground Truth] Using official SciFact annotations (gt_pids)\n");
     fflush(stdout);
 
     // Recall calculation based on official GT annotations (per-query average)
@@ -538,7 +539,7 @@ TEST_CASE("MS MARCO ColBERT: Direct vs MUVERA", "[msmarco_emb_list]") {
 
     // ========== Summary ==========
     printf("\n============================================================================================\n");
-    printf("                              Summary (MS MARCO)                                            \n");
+    printf("                              Summary (SciFact)                                             \n");
     printf("============================================================================================\n");
 
     // Header with topk columns

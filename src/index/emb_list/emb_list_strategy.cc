@@ -17,6 +17,7 @@ namespace knowhere {
 
 EmbListStrategyPtr CreateDirectEmbListStrategy();
 EmbListStrategyPtr CreateMuveraEmbListStrategy();
+EmbListStrategyPtr CreateLemurEmbListStrategy();
 
 expected<EmbListStrategyPtr>
 CreateEmbListStrategy(const std::string& strategy_type, const BaseConfig& config) {
@@ -25,6 +26,9 @@ CreateEmbListStrategy(const std::string& strategy_type, const BaseConfig& config
     }
     if (strategy_type == "muvera") {
         return CreateMuveraEmbListStrategy();
+    }
+    if (strategy_type == "lemur") {
+        return CreateLemurEmbListStrategy();
     }
     LOG_KNOWHERE_ERROR_ << "Unknown emb_list strategy: " << strategy_type;
     return expected<EmbListStrategyPtr>::Err(Status::invalid_args, "unknown emb_list strategy: " + strategy_type);
