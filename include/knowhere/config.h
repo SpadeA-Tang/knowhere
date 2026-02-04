@@ -653,6 +653,7 @@ class BaseConfig : public Config {
     CFG_INT lemur_batch_size;              // batch size for MLP training
     CFG_FLOAT lemur_learning_rate;         // learning rate for MLP training
     CFG_INT lemur_seed;                    // random seed for LEMUR
+    CFG_INT lemur_num_layers;              // number of layers in feature_extractor
     CFG_BOOL lemur_rerank;                 // whether to perform MaxSim reranking
     KNOHWERE_DECLARE_CONFIG(BaseConfig) {
         KNOWHERE_CONFIG_DECLARE_FIELD(dim).allow_empty_without_default().description("vector dim").for_train();
@@ -871,7 +872,7 @@ class BaseConfig : public Config {
             .for_train();
         KNOWHERE_CONFIG_DECLARE_FIELD(lemur_batch_size)
             .description("Batch size for LEMUR MLP training")
-            .set_default(64)
+            .set_default(256)
             .set_range(1, 4096)
             .for_train();
         KNOWHERE_CONFIG_DECLARE_FIELD(lemur_learning_rate)
@@ -882,6 +883,11 @@ class BaseConfig : public Config {
         KNOWHERE_CONFIG_DECLARE_FIELD(lemur_seed)
             .description("Random seed for LEMUR")
             .set_default(42)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_num_layers)
+            .description("Number of layers in LEMUR feature_extractor")
+            .set_default(2)
+            .set_range(1, 8)
             .for_train();
         KNOWHERE_CONFIG_DECLARE_FIELD(lemur_rerank)
             .description("Whether to perform MaxSim reranking after ANN search")

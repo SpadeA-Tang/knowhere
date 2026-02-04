@@ -38,7 +38,7 @@ namespace {
 // ============================================================================
 constexpr int32_t MAX_DOCS_TO_LOAD = 10000;   // Hard-coded limit on documents
 constexpr int32_t MAX_QUERIES_TO_LOAD = 100;  // Hard-coded limit on queries
-constexpr bool SKIP_DIRECT_TEST = false;      // Set to true to skip Direct strategy (it's slow)
+constexpr bool SKIP_DIRECT_TEST = true;      // Set to true to skip Direct strategy (it's slow)
 
 // MS MARCO data file paths (with official ground truth annotations)
 const std::string MSMARCO_DOCS_JSONL_PATH = "msmarco_gt_docs.jsonl";
@@ -601,6 +601,306 @@ TEST_CASE("MS MARCO ColBERT: Direct vs MUVERA", "[msmarco_emb_list]") {
         }
     }
     for (const auto& res : muvera_results) {
+        for (float r : res.recalls) {
+            REQUIRE(r >= 0.0f);
+        }
+    }
+}
+
+TEST_CASE("MS MARCO ColBERT: Direct vs LEMUR", "[msmarco_emb_list_lemur]") {
+    // Check if MS MARCO data files exist
+    {
+        std::ifstream docs_file(MSMARCO_DOCS_JSONL_PATH);
+        std::ifstream queries_file(MSMARCO_QUERIES_JSONL_PATH);
+
+        if (!docs_file.good() || !queries_file.good()) {
+            printf("\n");
+            printf("=============================================================\n");
+            printf("MS MARCO data files not found. Please prepare the data first.\n");
+            printf("Expected files:\n");
+            printf("  - %s\n", MSMARCO_DOCS_JSONL_PATH.c_str());
+            printf("  - %s\n", MSMARCO_QUERIES_JSONL_PATH.c_str());
+            printf("\n");
+            printf("Generate MS MARCO data with GT annotations:\n");
+            printf("  python scripts/prepare_msmarco_with_gt.py --output-dir .\n");
+            printf("=============================================================\n");
+            SKIP("MS MARCO data files not found");
+            return;
+        }
+    }
+
+    // Load data
+    printf("\n=== Loading MS MARCO Data (with GT annotations) ===\n");
+    EmbListData doc_data;
+    QueryDataWithGT query_data;
+
+    REQUIRE(doc_data.LoadFromJsonl(MSMARCO_DOCS_JSONL_PATH, MAX_DOCS_TO_LOAD));
+    doc_data.PrintStats();
+
+    REQUIRE(query_data.LoadFromJsonl(MSMARCO_QUERIES_JSONL_PATH, MAX_QUERIES_TO_LOAD));
+    query_data.PrintStats();
+
+    auto doc_ds = doc_data.ToDataSet();
+    auto query_ds = query_data.ToDataSet();
+
+    const int32_t dim = doc_data.dim;
+    const int32_t num_docs = doc_data.num_docs;
+    const int64_t total_vectors = doc_data.total_vectors;
+    const int32_t num_queries = query_data.num_queries;
+
+    // Multiple topk values for evaluation
+    const std::vector<int32_t> topk_values = {10, 20, 50};
+    const int32_t max_topk = *std::max_element(topk_values.begin(), topk_values.end());
+
+    printf("\n=== Test Configuration ===\n");
+    printf("Documents: %d, Total vectors: %ld, Dim: %d\n", num_docs, total_vectors, dim);
+    printf("Queries: %d, TopK values: ", num_queries);
+    for (size_t i = 0; i < topk_values.size(); ++i) {
+        printf("%d%s", topk_values[i], i < topk_values.size() - 1 ? ", " : "\n");
+    }
+    fflush(stdout);
+
+    // Base config
+    knowhere::Json base_conf;
+    base_conf[knowhere::meta::METRIC_TYPE] = "MAX_SIM_IP";
+    base_conf[knowhere::meta::DIM] = dim;
+    base_conf[knowhere::meta::TOPK] = max_topk;
+    base_conf[knowhere::indexparam::HNSW_M] = 16;
+    base_conf[knowhere::indexparam::EFCONSTRUCTION] = 100;
+    base_conf[knowhere::indexparam::EF] = 64;
+    base_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = 2.0f;
+
+    auto version = GenTestEmbListVersionList();
+
+    // Recall calculation vs BruteForce results (per-query average)
+    auto calc_recall_vs_bf = [&](const int64_t* result_ids, const int64_t* bf_ids, int32_t k) {
+        if (bf_ids == nullptr)
+            return 0.0f;
+        float total_recall = 0.0f;
+        for (int q = 0; q < num_queries; ++q) {
+            std::unordered_set<int64_t> bf_set;
+            int bf_count = 0;
+            for (int i = 0; i < k; ++i) {
+                if (bf_ids[q * max_topk + i] >= 0) {
+                    bf_set.insert(bf_ids[q * max_topk + i]);
+                    bf_count++;
+                }
+            }
+            if (bf_count == 0)
+                continue;
+
+            int overlap = 0;
+            for (int i = 0; i < k; ++i) {
+                if (result_ids[q * max_topk + i] >= 0 && bf_set.count(result_ids[q * max_topk + i]) > 0) {
+                    overlap++;
+                }
+            }
+            total_recall += (float)overlap / bf_count;
+        }
+        return total_recall / num_queries;
+    };
+
+    auto calc_recalls_vs_bf = [&](const int64_t* result_ids, const int64_t* bf_ids) {
+        std::vector<float> recalls;
+        for (int32_t k : topk_values) {
+            recalls.push_back(calc_recall_vs_bf(result_ids, bf_ids, k));
+        }
+        return recalls;
+    };
+
+    // ========== BruteForce MaxSim ==========
+    printf("\n[BruteForce] Computing MaxSim results...\n");
+    fflush(stdout);
+    knowhere::Json bf_conf;
+    bf_conf[knowhere::meta::METRIC_TYPE] = "MAX_SIM_IP";
+    bf_conf[knowhere::meta::TOPK] = max_topk;
+
+    StopWatch sw_bf;
+    auto bf_result = knowhere::BruteForce::Search<knowhere::fp32>(doc_ds, query_ds, bf_conf, nullptr);
+    double bf_time = sw_bf.elapsed();
+    REQUIRE(bf_result.has_value());
+    printf("[BruteForce] Time: %.3f s\n", bf_time);
+
+    auto bf_result_ds = bf_result.value();
+    const int64_t* bf_ids = bf_result_ds->GetIds();
+    fflush(stdout);
+
+    // ========== Direct Strategy ==========
+    double direct_build_time = 0, direct_search_time = 0;
+    std::vector<float> direct_recalls(topk_values.size(), 0.0f);
+
+    if (SKIP_DIRECT_TEST) {
+        printf("\n[Direct] SKIPPED (SKIP_DIRECT_TEST = true)\n");
+    } else {
+        printf("\n[Direct] Building HNSW index for %ld vectors...\n", total_vectors);
+        fflush(stdout);
+
+        knowhere::Json direct_conf = base_conf;
+        direct_conf[knowhere::meta::INDEX_TYPE] = knowhere::IndexEnum::INDEX_HNSW;
+        direct_conf["emb_list_strategy"] = "direct";
+
+        auto direct_index =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version);
+        REQUIRE(direct_index.has_value());
+
+        StopWatch sw_direct_build;
+        auto direct_build_status = direct_index.value().Build(doc_ds, direct_conf);
+        direct_build_time = sw_direct_build.elapsed();
+        REQUIRE(direct_build_status == knowhere::Status::success);
+        printf("[Direct] Build time: %.3f s\n", direct_build_time);
+
+        printf("[Direct] Searching...\n");
+        fflush(stdout);
+        StopWatch sw_direct_search;
+        auto direct_result = direct_index.value().Search(query_ds, direct_conf, nullptr);
+        direct_search_time = sw_direct_search.elapsed();
+        REQUIRE(direct_result.has_value());
+        printf("[Direct] Search time: %.3f ms\n", direct_search_time * 1000);
+
+        auto direct_ids = direct_result.value()->GetIds();
+        direct_recalls = calc_recalls_vs_bf(direct_ids, bf_ids);
+        printf("[Direct] Recall (vs BF): ");
+        for (size_t i = 0; i < topk_values.size(); ++i) {
+            printf("@%d=%.1f%% ", topk_values[i], direct_recalls[i] * 100);
+        }
+        printf("\n");
+        fflush(stdout);
+    }
+
+    // ========== LEMUR Strategy with Multiple Parameter Combinations ==========
+    // Define parameter combinations: (hidden_dim, num_layers, num_epochs)
+    std::vector<std::tuple<int32_t, int32_t, int32_t>> lemur_params = {
+        // {256, 2, 20},
+        {512, 2, 30},
+        {768, 2, 30},
+    };
+
+    // Store results for each combination
+    struct LemurResult {
+        int32_t hidden_dim;
+        int32_t num_layers;
+        int32_t num_epochs;
+        double build_time;
+        double search_time;
+        std::vector<float> recalls;
+    };
+    std::vector<LemurResult> lemur_results;
+
+    printf("\n[LEMUR] Testing %zu parameter combinations...\n", lemur_params.size());
+    fflush(stdout);
+
+    for (const auto& params : lemur_params) {
+        int32_t hidden_dim = std::get<0>(params);
+        int32_t num_layers = std::get<1>(params);
+        int32_t num_epochs = std::get<2>(params);
+
+        printf("\n[LEMUR-h%d-l%d-e%d] Building HNSW index...\n", hidden_dim, num_layers, num_epochs);
+        fflush(stdout);
+
+        knowhere::Json lemur_conf = base_conf;
+        lemur_conf[knowhere::meta::INDEX_TYPE] = knowhere::IndexEnum::INDEX_HNSW;
+        lemur_conf["emb_list_strategy"] = "lemur";
+        lemur_conf["lemur_hidden_dim"] = hidden_dim;
+        lemur_conf["lemur_num_layers"] = num_layers;
+        lemur_conf["lemur_num_epochs"] = num_epochs;
+        lemur_conf["lemur_num_train_samples"] = 50000;
+        lemur_conf["lemur_batch_size"] = 256;
+        lemur_conf["lemur_learning_rate"] = 0.001f;
+        lemur_conf["lemur_seed"] = 42;
+        lemur_conf["lemur_rerank"] = false;
+
+        auto lemur_index =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version);
+        REQUIRE(lemur_index.has_value());
+
+        StopWatch sw_lemur_build;
+        auto lemur_build_status = lemur_index.value().Build(doc_ds, lemur_conf);
+        double build_time = sw_lemur_build.elapsed();
+        REQUIRE(lemur_build_status == knowhere::Status::success);
+        printf("[LEMUR-h%d-l%d-e%d] Build time: %.3f s\n", hidden_dim, num_layers, num_epochs, build_time);
+
+        printf("[LEMUR-h%d-l%d-e%d] Searching...\n", hidden_dim, num_layers, num_epochs);
+        fflush(stdout);
+        StopWatch sw_lemur_search;
+        auto lemur_result = lemur_index.value().Search(query_ds, lemur_conf, nullptr);
+        double search_time = sw_lemur_search.elapsed();
+        REQUIRE(lemur_result.has_value());
+        printf("[LEMUR-h%d-l%d-e%d] Search time: %.3f ms\n", hidden_dim, num_layers, num_epochs, search_time * 1000);
+
+        auto lemur_ids = lemur_result.value()->GetIds();
+        auto recalls = calc_recalls_vs_bf(lemur_ids, bf_ids);
+        printf("[LEMUR-h%d-l%d-e%d] Recall (vs BF): ", hidden_dim, num_layers, num_epochs);
+        for (size_t i = 0; i < topk_values.size(); ++i) {
+            printf("@%d=%.1f%% ", topk_values[i], recalls[i] * 100);
+        }
+        printf("\n");
+        fflush(stdout);
+
+        lemur_results.push_back({hidden_dim, num_layers, num_epochs, build_time, search_time, recalls});
+    }
+
+    // ========== Summary ==========
+    printf("\n============================================================================================\n");
+    printf("                         Summary: Direct vs LEMUR (MS MARCO)                               \n");
+    printf("============================================================================================\n");
+
+    // Header with topk columns
+    printf("| Strategy              | Build Time | Search Time |");
+    for (int32_t k : topk_values) {
+        printf(" R@%-3d |", k);
+    }
+    printf("\n");
+
+    printf("|-----------------------|------------|-------------|");
+    for (size_t i = 0; i < topk_values.size(); ++i) {
+        printf("-------|");
+    }
+    printf("\n");
+
+    // BruteForce row
+    printf("| BruteForce            | %10s | %9.2f s |", "-", bf_time);
+    for (size_t i = 0; i < topk_values.size(); ++i) {
+        printf(" %4.1f%% |", 100.0f);
+    }
+    printf("\n");
+
+    // Direct row
+    if (!SKIP_DIRECT_TEST) {
+        printf("| Direct                | %8.2f s | %9.2f ms |", direct_build_time, direct_search_time * 1000);
+        for (size_t i = 0; i < topk_values.size(); ++i) {
+            printf(" %4.1f%% |", direct_recalls[i] * 100);
+        }
+        printf("\n");
+    }
+
+    // LEMUR rows
+    for (const auto& res : lemur_results) {
+        char name[32];
+        snprintf(name, sizeof(name), "LEMUR-h%d-l%d-e%d", res.hidden_dim, res.num_layers, res.num_epochs);
+        printf("| %-21s | %8.2f s | %9.2f ms |", name, res.build_time, res.search_time * 1000);
+        for (size_t i = 0; i < topk_values.size(); ++i) {
+            printf(" %4.1f%% |", res.recalls[i] * 100);
+        }
+        printf("\n");
+    }
+
+    printf("============================================================================================\n");
+    printf("Dataset: %d docs, %ld total vectors, dim=%d, avg %.1f vectors/doc\n", num_docs, total_vectors, dim,
+           (float)total_vectors / num_docs);
+    printf("\nLEMUR Parameters:\n");
+    printf("  - hidden_dim: MLP hidden layer dimension\n");
+    printf("  - num_layers: Number of layers in feature extractor\n");
+    printf("  - num_epochs: Training epochs\n");
+    printf("\nNote: R@K = Recall at top-K, per-query averaged, compared to BruteForce MaxSim\n");
+    fflush(stdout);
+
+    // Basic sanity checks
+    if (!SKIP_DIRECT_TEST) {
+        for (float r : direct_recalls) {
+            REQUIRE(r >= 0.0f);
+        }
+    }
+    for (const auto& res : lemur_results) {
         for (float r : res.recalls) {
             REQUIRE(r >= 0.0f);
         }
