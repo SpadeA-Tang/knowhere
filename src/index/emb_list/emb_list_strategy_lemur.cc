@@ -125,7 +125,10 @@ class LemurEmbListStrategy : public EmbListStrategy {
 
         LOG_KNOWHERE_INFO_ << "LEMUR: Computed MaxSim labels in " << label_ms << " ms";
 
-        // 5. Normalize labels (z-score normalization for stable training)
+        // 5. Save raw labels for OLS (original LEMUR uses raw MaxSim, not normalized)
+        std::vector<float> y_train_raw = y_train;
+
+        // 6. Normalize labels (z-score normalization for stable MLP training)
         float label_mean = 0.0f, label_std = 0.0f;
         size_t label_count = actual_samples * num_docs_;
         for (size_t i = 0; i < label_count; ++i) {
@@ -188,9 +191,9 @@ class LemurEmbListStrategy : public EmbListStrategy {
             ZtZ[i * final_hidden_dim_ + i] += lambda;
         }
 
-        // Compute Z^T @ Y using BLAS (Y is y_train, already normalized)
+        // Compute Z^T @ Y using BLAS (Y is raw MaxSim labels, matching original LEMUR)
         cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, final_hidden_dim_, num_docs_, actual_samples, 1.0f,
-                    Z.data(), final_hidden_dim_, y_train.data(), num_docs_, 0.0f, ZtY.data(), num_docs_);
+                    Z.data(), final_hidden_dim_, y_train_raw.data(), num_docs_, 0.0f, ZtY.data(), num_docs_);
 
         // Solve (Z^T Z) @ W^T = Z^T Y using Cholesky decomposition
         // Since ZtZ is symmetric positive definite (with regularization), use Cholesky
@@ -386,10 +389,17 @@ class LemurEmbListStrategy : public EmbListStrategy {
         auto rerank_start = std::chrono::high_resolution_clock::now();
         auto search_pool = ThreadPool::GetGlobalSearchThreadPool();
 
+        // Statistics for logging
+        size_t total_candidates = 0;
+        size_t total_doc_vecs = 0;
+        size_t total_query_vecs = 0;
+        size_t total_distance_computations = 0;
+
         for (size_t q = 0; q < num_query_docs; ++q) {
             size_t q_vec_start = query_offset.offset[q];
             size_t q_vec_end = query_offset.offset[q + 1];
             size_t nq = q_vec_end - q_vec_start;
+            total_query_vecs += nq;
 
             // Collect candidate doc IDs
             std::unordered_set<int64_t> candidate_docs;
@@ -399,13 +409,18 @@ class LemurEmbListStrategy : public EmbListStrategy {
                     candidate_docs.insert(doc_id);
                 }
             }
+            total_candidates += candidate_docs.size();
 
-            // Pre-allocate distance matrix
+            // Pre-allocate distance matrix and count doc vectors
             size_t max_doc_len = 0;
+            size_t query_doc_vecs = 0;
             for (int64_t doc_id : candidate_docs) {
                 size_t doc_len = emb_list_offset_->offset[doc_id + 1] - emb_list_offset_->offset[doc_id];
                 max_doc_len = std::max(max_doc_len, doc_len);
+                query_doc_vecs += doc_len;
             }
+            total_doc_vecs += query_doc_vecs;
+            total_distance_computations += nq * query_doc_vecs;
             std::vector<float> dist_matrix(nq * max_doc_len);
 
             auto compute_score = [&](int64_t doc_id) -> std::optional<float> {
@@ -460,7 +475,12 @@ class LemurEmbListStrategy : public EmbListStrategy {
         auto rerank_end = std::chrono::high_resolution_clock::now();
         double rerank_ms = std::chrono::duration<double, std::milli>(rerank_end - rerank_start).count();
 
-        LOG_KNOWHERE_INFO_ << "[LEMUR] Stage3 Rerank: " << rerank_ms << " ms";
+        double avg_doc_len = total_candidates > 0 ? (double)total_doc_vecs / total_candidates : 0;
+        double avg_query_len = num_query_docs > 0 ? (double)total_query_vecs / num_query_docs : 0;
+        LOG_KNOWHERE_INFO_ << "[LEMUR] Stage3 Rerank: " << rerank_ms << " ms"
+                           << ", total_candidates=" << total_candidates << ", avg_doc_len=" << avg_doc_len
+                           << ", avg_query_len=" << avg_query_len
+                           << ", total_dist_comps=" << total_distance_computations;
 
         return GenResultDataSet((int64_t)num_query_docs, (int64_t)k, std::move(ids), std::move(dists));
     }

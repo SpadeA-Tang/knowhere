@@ -279,11 +279,14 @@ class MuveraEmbListStrategy : public EmbListStrategy {
         double total_distance_compute_ms = 0;
         size_t total_candidates = 0;
         size_t total_distance_computations = 0;
+        size_t total_doc_vecs = 0;
+        size_t total_query_vecs = 0;
 
         for (size_t q = 0; q < num_query_docs; ++q) {
             size_t q_vec_start = query_offset.offset[q];
             size_t q_vec_end = query_offset.offset[q + 1];
             size_t nq = q_vec_end - q_vec_start;
+            total_query_vecs += nq;
 
             // Collect unique candidate doc IDs
             auto collect_start = std::chrono::high_resolution_clock::now();
@@ -305,10 +308,13 @@ class MuveraEmbListStrategy : public EmbListStrategy {
             // Pre-allocate distance matrix buffer (reused across all candidates)
             // Size: nq * max_doc_len, where max_doc_len is the maximum vectors per document
             size_t max_doc_len = 0;
+            size_t query_doc_vecs = 0;
             for (int64_t doc_id : candidate_docs) {
                 size_t doc_len = emb_list_offset_->offset[doc_id + 1] - emb_list_offset_->offset[doc_id];
                 max_doc_len = std::max(max_doc_len, doc_len);
+                query_doc_vecs += doc_len;
             }
+            total_doc_vecs += query_doc_vecs;
             std::vector<float> dist_matrix(nq * max_doc_len);
 
             // Get thread pool for parallel distance computation (same as Direct strategy)
@@ -378,11 +384,14 @@ class MuveraEmbListStrategy : public EmbListStrategy {
         auto rerank_end = std::chrono::high_resolution_clock::now();
         double rerank_ms = std::chrono::duration<double, std::milli>(rerank_end - rerank_start).count();
 
+        double avg_doc_len = total_candidates > 0 ? (double)total_doc_vecs / total_candidates : 0;
+        double avg_query_len = num_query_docs > 0 ? (double)total_query_vecs / num_query_docs : 0;
         LOG_KNOWHERE_INFO_ << "[MUVERA] Stage3 Rerank: " << rerank_ms << " ms"
                            << ", candidate_collect=" << total_candidate_collect_ms << " ms"
                            << ", distance_compute=" << total_distance_compute_ms << " ms"
-                           << ", total_candidates=" << total_candidates
-                           << ", total_distance_computations=" << total_distance_computations;
+                           << ", total_candidates=" << total_candidates << ", avg_doc_len=" << avg_doc_len
+                           << ", avg_query_len=" << avg_query_len
+                           << ", total_dist_comps=" << total_distance_computations;
 
         return GenResultDataSet((int64_t)num_query_docs, (int64_t)k, std::move(ids), std::move(dists));
     }

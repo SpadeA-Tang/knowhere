@@ -276,7 +276,7 @@ def main():
     print(f"CUDA available: {torch.cuda.is_available()}")
 
     config = ColBERTConfig(doc_maxlen=COLBERT_DOC_MAXLEN, query_maxlen=32)
-    checkpoint = Checkpoint("colbert-ir/colbertv2.0", colbert_config=config)
+    checkpoint = Checkpoint("jinaai/jina-colbert-v2", colbert_config=config)
 
     # Step 6: Encode passages
     print(f"\n=== Step 6: Encoding {len(all_pids)} passages ===")

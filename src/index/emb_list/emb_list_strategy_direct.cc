@@ -132,6 +132,7 @@ class DirectEmbListStrategy : public EmbListStrategy {
         size_t total_candidates = 0;
         size_t total_distance_computations = 0;
         size_t total_vecs_traversed = 0;
+        size_t total_doc_vecs = 0;
 
         for (size_t i = 0; i < num_q_el; i++) {
             auto start_offset = query_offset.offset[i];
@@ -217,6 +218,7 @@ class DirectEmbListStrategy : public EmbListStrategy {
                 }
 
                 auto vids = emb_list_offset_->get_vids((size_t)doc_id);
+                total_doc_vecs += vids.size();
                 total_distance_computations += nq * vids.size();
                 auto bf_search_res = ctx.calc_distance_by_ids(bf_query_dataset, vids.data(), vids.size(), is_cosine);
                 if (!bf_search_res.has_value()) {
@@ -241,6 +243,8 @@ class DirectEmbListStrategy : public EmbListStrategy {
 
         auto stage2_end = std::chrono::high_resolution_clock::now();
         double stage2_ms = std::chrono::duration<double, std::milli>(stage2_end - stage2_start).count();
+        double avg_doc_len = total_candidates > 0 ? (double)total_doc_vecs / total_candidates : 0;
+        double avg_query_len = num_q_el > 0 ? (double)total_query_vecs / num_q_el : 0;
         LOG_KNOWHERE_INFO_ << "[Direct] Stage2 Rerank: " << stage2_ms << " ms"
                            << ", candidate_collect=" << total_candidate_collect_ms << " ms"
                            << ", rerank_compute=" << total_rerank_ms << " ms"
@@ -248,6 +252,8 @@ class DirectEmbListStrategy : public EmbListStrategy {
                            << ", avg_vecs_traversed_per_query=" << (num_q_el > 0 ? (double)total_vecs_traversed / num_q_el : 0)
                            << ", total_candidates=" << total_candidates
                            << ", avg_candidates_per_query=" << (num_q_el > 0 ? (double)total_candidates / num_q_el : 0)
+                           << ", avg_doc_len=" << avg_doc_len
+                           << ", avg_query_len=" << avg_query_len
                            << ", total_dist_comps=" << total_distance_computations
                            << ", avg_dist_comps_per_query=" << (num_q_el > 0 ? (double)total_distance_computations / num_q_el : 0);
 

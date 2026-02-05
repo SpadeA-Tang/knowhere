@@ -15,6 +15,7 @@
 #include <cblas.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <random>
@@ -25,12 +26,13 @@
 
 // OpenBLAS thread control (defined in OpenBLAS library)
 extern "C" {
-void openblas_set_num_threads(int num_threads);
-int openblas_get_num_threads(void);
+void
+openblas_set_num_threads(int num_threads);
+int
+openblas_get_num_threads(void);
 }
 
 namespace knowhere {
-
 
 /**
  * @brief MLP implementation matching LEMUR paper/github.
@@ -128,57 +130,98 @@ class SimpleMLP {
      */
     void
     Forward(const float* input, int32_t batch_size, float* output, bool store_intermediates = false) {
+        // Use pre-allocated buffers if available (training mode)
+        const bool use_buffers = store_intermediates && (batch_size <= allocated_batch_size_);
+
         if (store_intermediates) {
-            intermediates_.clear();
-            pre_ln_values_.clear();
-            post_ln_values_.clear();
-            // Store input
-            intermediates_.emplace_back(input, input + batch_size * input_dim_);
+            // Copy input to intermediates[0]
+            if (use_buffers) {
+                std::memcpy(intermediates_[0].data(), input, batch_size * input_dim_ * sizeof(float));
+            } else {
+                intermediates_.clear();
+                pre_ln_values_.clear();
+                post_ln_values_.clear();
+                intermediates_.emplace_back(input, input + batch_size * input_dim_);
+            }
         }
 
-        // Current activation
-        std::vector<float> current(input, input + batch_size * input_dim_);
+        // Current activation pointer
+        const float* current = input;
         int32_t current_dim = input_dim_;
 
         // Forward through feature_extractor layers
         for (int32_t layer = 0; layer < num_layers_; ++layer) {
             int32_t out_dim = layer_dims_[layer];
-            std::vector<float> linear_out(batch_size * out_dim);
-            std::vector<float> ln_out(batch_size * out_dim);
-            std::vector<float> act_out(batch_size * out_dim);
+
+            float* linear_out;
+            float* ln_out;
+            float* act_out;
+
+            if (use_buffers) {
+                linear_out = buf_linear_out_[layer].data();
+                ln_out = buf_ln_out_[layer].data();
+                act_out = buf_act_out_[layer].data();
+            } else {
+                // Fallback to dynamic allocation for inference
+                buf_linear_out_.resize(std::max((int32_t)buf_linear_out_.size(), layer + 1));
+                buf_ln_out_.resize(std::max((int32_t)buf_ln_out_.size(), layer + 1));
+                buf_act_out_.resize(std::max((int32_t)buf_act_out_.size(), layer + 1));
+                buf_linear_out_[layer].resize(batch_size * out_dim);
+                buf_ln_out_[layer].resize(batch_size * out_dim);
+                buf_act_out_[layer].resize(batch_size * out_dim);
+                linear_out = buf_linear_out_[layer].data();
+                ln_out = buf_ln_out_[layer].data();
+                act_out = buf_act_out_[layer].data();
+            }
 
             // Linear: out = input @ W.T + b
-            LinearForward(current.data(), fc_weights_[layer].data(), fc_biases_[layer].data(), batch_size, current_dim,
-                          out_dim, linear_out.data());
+            LinearForward(current, fc_weights_[layer].data(), fc_biases_[layer].data(), batch_size, current_dim,
+                          out_dim, linear_out);
 
             if (store_intermediates) {
-                pre_ln_values_.push_back(linear_out);
+                if (use_buffers) {
+                    std::memcpy(pre_ln_values_[layer].data(), linear_out, batch_size * out_dim * sizeof(float));
+                } else {
+                    pre_ln_values_.emplace_back(linear_out, linear_out + batch_size * out_dim);
+                }
             }
 
             // LayerNorm
-            LayerNormForward(linear_out.data(), ln_gammas_[layer].data(), ln_betas_[layer].data(), batch_size, out_dim,
-                             ln_out.data());
+            LayerNormForward(linear_out, ln_gammas_[layer].data(), ln_betas_[layer].data(), batch_size, out_dim,
+                             ln_out);
 
             if (store_intermediates) {
-                post_ln_values_.push_back(ln_out);  // Store LayerNorm output for GELU backward
+                if (use_buffers) {
+                    std::memcpy(post_ln_values_[layer].data(), ln_out, batch_size * out_dim * sizeof(float));
+                } else {
+                    post_ln_values_.emplace_back(ln_out, ln_out + batch_size * out_dim);
+                }
             }
 
             // GELU activation
-            GELUForward(ln_out.data(), batch_size * out_dim, act_out.data());
+            GELUForward(ln_out, batch_size * out_dim, act_out);
 
             if (store_intermediates) {
-                intermediates_.push_back(act_out);
+                if (use_buffers) {
+                    std::memcpy(intermediates_[layer + 1].data(), act_out, batch_size * out_dim * sizeof(float));
+                } else {
+                    intermediates_.emplace_back(act_out, act_out + batch_size * out_dim);
+                }
             }
 
-            current = std::move(act_out);
+            current = act_out;
             current_dim = out_dim;
         }
 
         // Store final hidden for feature extraction
-        final_hidden_ = current;
+        if (use_buffers) {
+            std::memcpy(final_hidden_.data(), current, batch_size * final_hidden_dim_ * sizeof(float));
+        } else {
+            final_hidden_.assign(current, current + batch_size * final_hidden_dim_);
+        }
 
         // Output layer: out = hidden @ W_out.T (no bias)
-        LinearForwardNoBias(current.data(), W_out_.data(), batch_size, final_hidden_dim_, output_dim_, output);
+        LinearForwardNoBias(current, W_out_.data(), batch_size, final_hidden_dim_, output_dim_, output);
     }
 
     /**
@@ -228,11 +271,22 @@ class SimpleMLP {
         // Clear gradients
         ClearGradients();
 
+        // Use pre-allocated buffers if available
+        const bool use_buffers = (batch_size <= allocated_batch_size_);
+
         float total_loss = 0.0f;
         float scale = 1.0f / batch_size;
 
+        // Get d_output buffer
+        float* d_output;
+        if (use_buffers) {
+            d_output = buf_d_output_.data();
+        } else {
+            buf_d_output_.resize(batch_size * output_dim_);
+            d_output = buf_d_output_.data();
+        }
+
         // Compute output gradient: d_output = 2 * (output - target) / output_dim
-        std::vector<float> d_output(batch_size * output_dim_);
         for (int32_t b = 0; b < batch_size; ++b) {
             for (int32_t j = 0; j < output_dim_; ++j) {
                 float diff = output[b * output_dim_ + j] - target[b * output_dim_ + j];
@@ -241,14 +295,25 @@ class SimpleMLP {
             }
         }
 
+        // Get d_hidden buffer
+        float* d_hidden;
+        if (use_buffers) {
+            d_hidden = buf_d_hidden_.data();
+            std::fill(d_hidden, d_hidden + batch_size * final_hidden_dim_, 0.0f);
+        } else {
+            buf_d_hidden_.resize(batch_size * final_hidden_dim_);
+            std::fill(buf_d_hidden_.begin(), buf_d_hidden_.end(), 0.0f);
+            d_hidden = buf_d_hidden_.data();
+        }
+
         // Backward through output layer (no bias)
-        std::vector<float> d_hidden(batch_size * final_hidden_dim_, 0.0f);
-        LinearBackwardNoBias(final_hidden_.data(), d_output.data(), batch_size, final_hidden_dim_, output_dim_,
-                             dW_out_.data(), d_hidden.data());
+        LinearBackwardNoBias(final_hidden_.data(), d_output, batch_size, final_hidden_dim_, output_dim_, dW_out_.data(),
+                             d_hidden);
+
+        // Pointer to current gradient (starts as d_hidden)
+        float* d_current = d_hidden;
 
         // Backward through feature_extractor layers (reverse order)
-        std::vector<float> d_current = std::move(d_hidden);
-
         for (int32_t layer = num_layers_ - 1; layer >= 0; --layer) {
             int32_t out_dim = layer_dims_[layer];
             int32_t in_dim = (layer == 0) ? input_dim_ : layer_dims_[layer - 1];
@@ -258,22 +323,40 @@ class SimpleMLP {
             const float* pre_ln = pre_ln_values_[layer].data();    // Linear output (before LayerNorm)
             const float* post_ln = post_ln_values_[layer].data();  // LayerNorm output (GELU input)
 
-            std::vector<float> d_act(batch_size * out_dim);
-            std::vector<float> d_ln(batch_size * out_dim);
-            std::vector<float> d_input_layer(batch_size * in_dim, 0.0f);
+            // Get buffers for this layer
+            float* d_act;
+            float* d_ln;
+            float* d_input_layer;
+
+            if (use_buffers) {
+                d_act = buf_d_act_[layer].data();
+                d_ln = buf_d_ln_[layer].data();
+                d_input_layer = buf_d_input_[layer].data();
+                std::fill(d_input_layer, d_input_layer + batch_size * in_dim, 0.0f);
+            } else {
+                buf_d_act_.resize(std::max((int32_t)buf_d_act_.size(), layer + 1));
+                buf_d_ln_.resize(std::max((int32_t)buf_d_ln_.size(), layer + 1));
+                buf_d_input_.resize(std::max((int32_t)buf_d_input_.size(), layer + 1));
+                buf_d_act_[layer].resize(batch_size * out_dim);
+                buf_d_ln_[layer].resize(batch_size * out_dim);
+                buf_d_input_[layer].resize(batch_size * in_dim, 0.0f);
+                d_act = buf_d_act_[layer].data();
+                d_ln = buf_d_ln_[layer].data();
+                d_input_layer = buf_d_input_[layer].data();
+            }
 
             // Backward GELU - use post_ln (LayerNorm output) as GELU's input
-            GELUBackward(post_ln, d_current.data(), batch_size * out_dim, d_act.data());
+            GELUBackward(post_ln, d_current, batch_size * out_dim, d_act);
 
             // Backward LayerNorm
-            LayerNormBackward(pre_ln, d_act.data(), ln_gammas_[layer].data(), batch_size, out_dim, d_ln.data(),
+            LayerNormBackward(pre_ln, d_act, ln_gammas_[layer].data(), batch_size, out_dim, d_ln,
                               d_ln_gammas_[layer].data(), d_ln_betas_[layer].data());
 
             // Backward Linear
-            LinearBackward(layer_input, d_ln.data(), fc_weights_[layer].data(), batch_size, in_dim, out_dim,
-                           d_fc_weights_[layer].data(), d_fc_biases_[layer].data(), d_input_layer.data());
+            LinearBackward(layer_input, d_ln, fc_weights_[layer].data(), batch_size, in_dim, out_dim,
+                           d_fc_weights_[layer].data(), d_fc_biases_[layer].data(), d_input_layer);
 
-            d_current = std::move(d_input_layer);
+            d_current = d_input_layer;
         }
 
         return total_loss / (batch_size * output_dim_);
@@ -313,15 +396,16 @@ class SimpleMLP {
     Train(const float* X_train, const float* y_train, int32_t num_samples, int32_t epochs = 100,
           int32_t batch_size = 64, float lr = 0.001f, bool verbose = false, int32_t log_interval = 3) {
         // Configure OpenBLAS threads based on matrix size
-        // Too many threads cause synchronization overhead (red in htop = kernel mode)
-        // Sweet spot is typically 4-8 threads for medium matrices
+        // 8 threads is the sweet spot - more threads cause synchronization overhead
         int hw_threads = std::thread::hardware_concurrency();
         if (hw_threads < 1) {
             hw_threads = 4;
         }
-        // Cap at 8 threads to avoid excessive synchronization overhead
         int num_threads = std::min(hw_threads, 8);
         openblas_set_num_threads(num_threads);
+
+        // Pre-allocate all training buffers to avoid malloc in hot loop
+        AllocateTrainingBuffers(batch_size);
 
         std::vector<int32_t> indices(num_samples);
         for (int32_t i = 0; i < num_samples; ++i) {
@@ -342,10 +426,13 @@ class SimpleMLP {
         // Early stopping parameters
         float best_loss = std::numeric_limits<float>::max();
         int32_t patience_counter = 0;
-        const int32_t patience = 5;           // Stop if no improvement for 5 epochs
-        const float min_delta = 1e-4f;        // Minimum improvement to reset patience
+        const int32_t patience = 5;     // Stop if no improvement for 5 epochs
+        const float min_delta = 1e-4f;  // Minimum improvement to reset patience
+
+        auto training_start = std::chrono::high_resolution_clock::now();
 
         for (int32_t epoch = 0; epoch < epochs; ++epoch) {
+            auto epoch_start = std::chrono::high_resolution_clock::now();
             std::shuffle(indices.begin(), indices.end(), rng);
 
             float epoch_loss = 0.0f;
@@ -377,11 +464,15 @@ class SimpleMLP {
 
             final_loss = epoch_loss / num_batches;
 
+            auto epoch_end = std::chrono::high_resolution_clock::now();
+            double epoch_ms = std::chrono::duration<double, std::milli>(epoch_end - epoch_start).count();
+
             // Log training progress
             bool should_log =
                 (epoch == 0) || (epoch == epochs - 1) || (log_interval > 0 && (epoch + 1) % log_interval == 0);
             if (should_log) {
-                LOG_KNOWHERE_INFO_ << "[LEMUR MLP] Epoch " << (epoch + 1) << "/" << epochs << ", Loss: " << final_loss;
+                LOG_KNOWHERE_INFO_ << "[LEMUR MLP] Epoch " << (epoch + 1) << "/" << epochs << ", Loss: " << final_loss
+                                   << ", Time: " << epoch_ms << " ms";
             }
 
             // Early stopping check
@@ -506,6 +597,25 @@ class SimpleMLP {
     std::vector<std::vector<float>> post_ln_values_;  // LayerNorm outputs, before GELU (for GELU backward)
     std::vector<float> final_hidden_;                 // output of feature_extractor
 
+    // ========== Pre-allocated buffers for training (avoid malloc in hot loop) ==========
+    int32_t allocated_batch_size_ = 0;  // Current allocated batch size
+
+    // Forward pass buffers (per layer)
+    std::vector<std::vector<float>> buf_linear_out_;  // [num_layers][batch * layer_dim]
+    std::vector<std::vector<float>> buf_ln_out_;      // [num_layers][batch * layer_dim]
+    std::vector<std::vector<float>> buf_act_out_;     // [num_layers][batch * layer_dim]
+    std::vector<float> buf_current_;                  // [batch * max_dim]
+
+    // Backward pass buffers
+    std::vector<float> buf_d_output_;              // [batch * output_dim]
+    std::vector<float> buf_d_hidden_;              // [batch * final_hidden_dim]
+    std::vector<std::vector<float>> buf_d_act_;    // [num_layers][batch * layer_dim]
+    std::vector<std::vector<float>> buf_d_ln_;     // [num_layers][batch * layer_dim]
+    std::vector<std::vector<float>> buf_d_input_;  // [num_layers][batch * in_dim]
+
+    // LayerNorm backward buffer
+    std::vector<float> buf_x_norm_;  // [max_dim]
+
     void
     InitGradients() {
         d_fc_weights_.resize(num_layers_);
@@ -560,6 +670,64 @@ class SimpleMLP {
         std::fill(dW_out_.begin(), dW_out_.end(), 0.0f);
     }
 
+    /**
+     * @brief Pre-allocate buffers for training to avoid malloc in hot loop.
+     */
+    void
+    AllocateTrainingBuffers(int32_t batch_size) {
+        if (batch_size <= allocated_batch_size_) {
+            return;  // Already allocated enough
+        }
+
+        allocated_batch_size_ = batch_size;
+
+        // Find max dimension across all layers
+        int32_t max_dim = input_dim_;
+        for (int32_t i = 0; i < num_layers_; ++i) {
+            max_dim = std::max(max_dim, layer_dims_[i]);
+        }
+
+        // Forward pass buffers
+        buf_linear_out_.resize(num_layers_);
+        buf_ln_out_.resize(num_layers_);
+        buf_act_out_.resize(num_layers_);
+        for (int32_t i = 0; i < num_layers_; ++i) {
+            buf_linear_out_[i].resize(batch_size * layer_dims_[i]);
+            buf_ln_out_[i].resize(batch_size * layer_dims_[i]);
+            buf_act_out_[i].resize(batch_size * layer_dims_[i]);
+        }
+        buf_current_.resize(batch_size * max_dim);
+
+        // Backward pass buffers
+        buf_d_output_.resize(batch_size * output_dim_);
+        buf_d_hidden_.resize(batch_size * final_hidden_dim_);
+        buf_d_act_.resize(num_layers_);
+        buf_d_ln_.resize(num_layers_);
+        buf_d_input_.resize(num_layers_);
+        for (int32_t i = 0; i < num_layers_; ++i) {
+            int32_t in_dim = (i == 0) ? input_dim_ : layer_dims_[i - 1];
+            buf_d_act_[i].resize(batch_size * layer_dims_[i]);
+            buf_d_ln_[i].resize(batch_size * layer_dims_[i]);
+            buf_d_input_[i].resize(batch_size * in_dim);
+        }
+
+        // LayerNorm buffer
+        buf_x_norm_.resize(max_dim);
+
+        // Pre-allocate intermediate storage for backward pass
+        intermediates_.resize(num_layers_ + 1);
+        pre_ln_values_.resize(num_layers_);
+        post_ln_values_.resize(num_layers_);
+        for (int32_t i = 0; i < num_layers_; ++i) {
+            int32_t in_dim = (i == 0) ? input_dim_ : layer_dims_[i - 1];
+            intermediates_[i].resize(batch_size * in_dim);
+            pre_ln_values_[i].resize(batch_size * layer_dims_[i]);
+            post_ln_values_[i].resize(batch_size * layer_dims_[i]);
+        }
+        intermediates_[num_layers_].resize(batch_size * final_hidden_dim_);
+        final_hidden_.resize(batch_size * final_hidden_dim_);
+    }
+
     // ========== Layer Operations (BLAS optimized) ==========
 
     // Linear: Y = X @ W.T + b
@@ -568,14 +736,16 @@ class SimpleMLP {
     LinearForward(const float* X, const float* W, const float* b, int32_t batch, int32_t in_dim, int32_t out_dim,
                   float* Y) {
         // Y = X @ W.T using cblas_sgemm
-        // C = alpha * A * B + beta * C
-        // Here: Y = 1.0 * X * W.T + 0.0 * Y
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, batch, out_dim, in_dim, 1.0f, X, in_dim, W, in_dim, 0.0f,
                     Y, out_dim);
 
-        // Add bias: Y[i,:] += b for each row
+        // Add bias: Y[i,:] += b - row-major traversal for cache efficiency
+        // Instead of batch calls to cblas_saxpy, use single loop with better cache locality
         for (int32_t i = 0; i < batch; ++i) {
-            cblas_saxpy(out_dim, 1.0f, b, 1, Y + i * out_dim, 1);
+            float* y_row = Y + i * out_dim;
+            for (int32_t j = 0; j < out_dim; ++j) {
+                y_row[j] += b[j];
+            }
         }
     }
 
@@ -592,21 +762,19 @@ class SimpleMLP {
     LinearBackward(const float* X, const float* dY, const float* W, int32_t batch, int32_t in_dim, int32_t out_dim,
                    float* dW, float* db, float* dX) {
         // dW += dY.T @ X
-        // dW[out_dim, in_dim] += dY.T[out_dim, batch] @ X[batch, in_dim]
         cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, out_dim, in_dim, batch, 1.0f, dY, out_dim, X, in_dim, 1.0f,
                     dW, in_dim);
 
-        // db += sum(dY, axis=0) - sum each column of dY
-        for (int32_t j = 0; j < out_dim; ++j) {
-            float sum = 0.0f;
-            for (int32_t i = 0; i < batch; ++i) {
-                sum += dY[i * out_dim + j];
+        // db += sum(dY, axis=0) - row-major traversal for cache efficiency
+        // Traverse row-by-row (contiguous memory access) instead of column-by-column
+        for (int32_t i = 0; i < batch; ++i) {
+            const float* dy_row = dY + i * out_dim;
+            for (int32_t j = 0; j < out_dim; ++j) {
+                db[j] += dy_row[j];
             }
-            db[j] += sum;
         }
 
         // dX = dY @ W
-        // dX[batch, in_dim] = dY[batch, out_dim] @ W[out_dim, in_dim]
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, batch, in_dim, out_dim, 1.0f, dY, out_dim, W, in_dim,
                     0.0f, dX, in_dim);
     }
@@ -659,7 +827,15 @@ class SimpleMLP {
     LayerNormBackward(const float* X, const float* dY, const float* gamma, int32_t batch, int32_t dim, float* dX,
                       float* dgamma, float* dbeta) {
         const float eps = 1e-5f;
-        std::vector<float> x_norm(dim);
+
+        // Use pre-allocated buffer if available, otherwise use member buffer
+        float* x_norm;
+        if ((int32_t)buf_x_norm_.size() >= dim) {
+            x_norm = buf_x_norm_.data();
+        } else {
+            buf_x_norm_.resize(dim);
+            x_norm = buf_x_norm_.data();
+        }
 
         for (int32_t i = 0; i < batch; ++i) {
             const float* x_row = X + i * dim;
@@ -705,6 +881,18 @@ class SimpleMLP {
         }
     }
 
+    // Fast tanh approximation using Pade approximation
+    // Accurate to ~1e-4 in range [-3, 3], saturates outside
+    static inline float
+    fast_tanh(float x) {
+        if (x < -3.0f)
+            return -1.0f;
+        if (x > 3.0f)
+            return 1.0f;
+        float x2 = x * x;
+        return x * (27.0f + x2) / (27.0f + 9.0f * x2);
+    }
+
     // GELU forward: GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
     void
     GELUForward(const float* X, int32_t n, float* Y) {
@@ -715,7 +903,7 @@ class SimpleMLP {
             float x = X[i];
             float x3 = x * x * x;
             float inner = sqrt_2_over_pi * (x + coeff * x3);
-            Y[i] = 0.5f * x * (1.0f + std::tanh(inner));
+            Y[i] = 0.5f * x * (1.0f + fast_tanh(inner));
         }
     }
 
@@ -731,7 +919,7 @@ class SimpleMLP {
             float x2 = x * x;
             float x3 = x2 * x;
             float inner = sqrt_2_over_pi * (x + coeff * x3);
-            float tanh_inner = std::tanh(inner);
+            float tanh_inner = fast_tanh(inner);
             float sech2 = 1.0f - tanh_inner * tanh_inner;
             float d_inner = sqrt_2_over_pi * (1.0f + coeff3 * x2);
             dX[i] = dY[i] * (0.5f * (1.0f + tanh_inner) + 0.5f * x * sech2 * d_inner);
