@@ -344,7 +344,8 @@ TEST_CASE("MS MARCO ColBERT: Direct vs MUVERA", "[msmarco_emb_list]") {
     printf("\n[Ground Truth] Using official MS MARCO annotations (gt_pids)\n");
     fflush(stdout);
 
-    // Recall calculation based on official GT annotations (per-query average)
+    // E2E Recall calculation based on official GT annotations (per-query average)
+    // Recall@k = (number of GT documents found in top-k results) / (total GT documents)
     // result_ids has result_k items per query
     auto calc_recall_vs_gt = [&](const int64_t* result_ids, int32_t result_k, int32_t k) {
         float total_recall = 0.0f;
@@ -997,7 +998,7 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
     const int32_t max_topk = *std::max_element(topk_values.begin(), topk_values.end());
 
     // ANN ratios to test
-    const std::vector<float> ann_ratios = {1.5f, 2.0f, 3.0f, 4.0f, 5.0f};
+    const std::vector<float> ann_ratios = {3.0f, 4.0f, 5.0f};
 
     printf("\n=== Test Configuration ===\n");
     printf("Dataset: %s\n", dataset_name.c_str());
@@ -1055,6 +1056,7 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
     };
 
     // E2E Recall calculation vs Ground Truth
+    // Recall@k = (number of GT documents found in top-k results) / (total GT documents)
     auto calc_recall_vs_gt = [&](const int64_t* result_ids, int32_t result_k, int32_t k) {
         float total_recall = 0.0f;
         int valid_queries = 0;
@@ -1112,8 +1114,10 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
         float ann_ratio;
         double build_time;
         double search_time;
-        std::vector<float> recalls;      // vs BruteForce
-        std::vector<float> e2e_recalls;  // vs Ground Truth
+        std::vector<float> recalls;           // vs BruteForce
+        std::vector<double> math_latencies;   // avg latency per query for each Math Recall topk (ms)
+        std::vector<float> e2e_recalls;       // vs Ground Truth
+        std::vector<double> e2e_latencies;    // avg latency per query for each E2E topk (ms)
     };
     std::vector<SearchResult> all_results;
 
@@ -1150,10 +1154,11 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
             float ann_ratio = ann_ratios[idx];
 
             std::vector<float> recalls;
+            std::vector<double> math_latencies;
             std::vector<float> e2e_recalls;
             double total_search_time = 0;
 
-            // Search for Math Recall (vs BF)
+            // Search for Math Recall (vs BF) with individual latency (avg per query)
             for (int32_t k : topk_values) {
                 knowhere::Json search_conf = direct_conf;
                 search_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = ann_ratio;
@@ -1168,37 +1173,42 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
                 auto result_ids = result.value()->GetIds();
                 float recall = calc_recall_vs_bf(result_ids, k, bf_ids_map[k], k, k);
                 recalls.push_back(recall);
+                math_latencies.push_back(search_time * 1000 / num_queries);  // ms per query
             }
 
-            // Search for E2E Recall (vs GT)
+            // Search for E2E Recall (vs GT) with individual latency (avg per query)
+            std::vector<double> e2e_latencies;
             for (int32_t k : e2e_topk_values) {
                 knowhere::Json search_conf = direct_conf;
                 search_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = ann_ratio;
                 search_conf[knowhere::meta::TOPK] = k;
 
+                StopWatch sw_e2e;
                 auto result = direct_index.value().Search(query_ds, search_conf, nullptr);
+                double e2e_latency = sw_e2e.elapsed() * 1000 / num_queries;  // ms per query
                 REQUIRE(result.has_value());
 
                 auto result_ids = result.value()->GetIds();
                 float e2e_recall = calc_recall_vs_gt(result_ids, k, k);
                 e2e_recalls.push_back(e2e_recall);
+                e2e_latencies.push_back(e2e_latency);
             }
 
-            printf("[Direct-ratio%.1f] Search time: %.3f ms, Recall: ", ann_ratio, total_search_time * 1000);
+            printf("[Direct-ratio%.1f] Recall: ", ann_ratio);
             for (size_t i = 0; i < topk_values.size(); ++i) {
-                printf("@%d=%.1f%% ", topk_values[i], recalls[i] * 100);
+                printf("@%d=%.1f%% (%.2fms) ", topk_values[i], recalls[i] * 100, math_latencies[i]);
             }
             printf("\n");
             printf("                  E2E Recall: ");
             for (size_t i = 0; i < e2e_topk_values.size(); ++i) {
-                printf("@%d=%.1f%% ", e2e_topk_values[i], e2e_recalls[i] * 100);
+                printf("@%d=%.1f%% (%.2fms) ", e2e_topk_values[i], e2e_recalls[i] * 100, e2e_latencies[i]);
             }
             printf("\n");
             fflush(stdout);
 
             char name[32];
             snprintf(name, sizeof(name), "Direct (ratio=%.1f)", ann_ratio);
-            all_results.push_back({name, ann_ratio, idx == 0 ? direct_build_time : 0, total_search_time, recalls, e2e_recalls});
+            all_results.push_back({name, ann_ratio, idx == 0 ? direct_build_time : 0, total_search_time, recalls, math_latencies, e2e_recalls, e2e_latencies});
         }
     } else {
         printf("\n[Direct] SKIPPED (SKIP_DIRECT_TEST = true)\n");
@@ -1207,7 +1217,7 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
 
     // ========== MUVERA Strategy ==========
     // Multiple MUVERA parameter combinations: (num_projections, num_repeats)
-    std::vector<std::pair<int32_t, int32_t>> muvera_params = {{3, 7}, {4, 7}, {5, 7}};
+    std::vector<std::pair<int32_t, int32_t>> muvera_params = {{3, 7}, {4, 7}};
 
     printf("\n[MUVERA] Testing %zu parameter combinations...\n", muvera_params.size());
     fflush(stdout);
@@ -1241,10 +1251,11 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
             float ann_ratio = ann_ratios[idx];
 
             std::vector<float> recalls;
+            std::vector<double> math_latencies;
             std::vector<float> e2e_recalls;
             double total_search_time = 0;
 
-            // Search for Math Recall (vs BF)
+            // Search for Math Recall (vs BF) with individual latency (avg per query)
             for (int32_t k : topk_values) {
                 knowhere::Json search_conf = muvera_conf;
                 search_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = ann_ratio;
@@ -1259,38 +1270,42 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
                 auto result_ids = result.value()->GetIds();
                 float recall = calc_recall_vs_bf(result_ids, k, bf_ids_map[k], k, k);
                 recalls.push_back(recall);
+                math_latencies.push_back(search_time * 1000 / num_queries);  // ms per query
             }
 
-            // Search for E2E Recall (vs GT)
+            // Search for E2E Recall (vs GT) with individual latency (avg per query)
+            std::vector<double> e2e_latencies;
             for (int32_t k : e2e_topk_values) {
                 knowhere::Json search_conf = muvera_conf;
                 search_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = ann_ratio;
                 search_conf[knowhere::meta::TOPK] = k;
 
+                StopWatch sw_e2e;
                 auto result = muvera_index.value().Search(query_ds, search_conf, nullptr);
+                double e2e_latency = sw_e2e.elapsed() * 1000 / num_queries;  // ms per query
                 REQUIRE(result.has_value());
 
                 auto result_ids = result.value()->GetIds();
                 float e2e_recall = calc_recall_vs_gt(result_ids, k, k);
                 e2e_recalls.push_back(e2e_recall);
+                e2e_latencies.push_back(e2e_latency);
             }
 
-            printf("[MUVERA-%d-%d-r%.1f] Search time: %.3f ms, Recall: ", num_proj, num_rep, ann_ratio,
-                   total_search_time * 1000);
+            printf("[MUVERA-%d-%d-r%.1f] Recall: ", num_proj, num_rep, ann_ratio);
             for (size_t i = 0; i < topk_values.size(); ++i) {
-                printf("@%d=%.1f%% ", topk_values[i], recalls[i] * 100);
+                printf("@%d=%.1f%% (%.2fms) ", topk_values[i], recalls[i] * 100, math_latencies[i]);
             }
             printf("\n");
             printf("                    E2E Recall: ");
             for (size_t i = 0; i < e2e_topk_values.size(); ++i) {
-                printf("@%d=%.1f%% ", e2e_topk_values[i], e2e_recalls[i] * 100);
+                printf("@%d=%.1f%% (%.2fms) ", e2e_topk_values[i], e2e_recalls[i] * 100, e2e_latencies[i]);
             }
             printf("\n");
             fflush(stdout);
 
             char name[48];
             snprintf(name, sizeof(name), "MUVERA-%d-%d (r=%.1f)", num_proj, num_rep, ann_ratio);
-            all_results.push_back({name, ann_ratio, idx == 0 ? muvera_build_time : 0, total_search_time, recalls, e2e_recalls});
+            all_results.push_back({name, ann_ratio, idx == 0 ? muvera_build_time : 0, total_search_time, recalls, math_latencies, e2e_recalls, e2e_latencies});
         }
     }
 
@@ -1333,10 +1348,11 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
         float ann_ratio = ann_ratios[idx];
 
         std::vector<float> recalls;
+        std::vector<double> math_latencies;
         std::vector<float> e2e_recalls;
         double total_search_time = 0;
 
-        // Search for Math Recall (vs BF)
+        // Search for Math Recall (vs BF) with individual latency (avg per query)
         for (int32_t k : topk_values) {
             knowhere::Json search_conf = lemur_conf;
             search_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = ann_ratio;
@@ -1351,122 +1367,141 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
             auto result_ids = result.value()->GetIds();
             float recall = calc_recall_vs_bf(result_ids, k, bf_ids_map[k], k, k);
             recalls.push_back(recall);
+            math_latencies.push_back(search_time * 1000 / num_queries);  // ms per query
         }
 
-        // Search for E2E Recall (vs GT)
+        // Search for E2E Recall (vs GT) with individual latency (avg per query)
+        std::vector<double> e2e_latencies;
         for (int32_t k : e2e_topk_values) {
             knowhere::Json search_conf = lemur_conf;
             search_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = ann_ratio;
             search_conf[knowhere::meta::TOPK] = k;
 
+            StopWatch sw_e2e;
             auto result = lemur_index.value().Search(query_ds, search_conf, nullptr);
+            double e2e_latency = sw_e2e.elapsed() * 1000 / num_queries;  // ms per query
             REQUIRE(result.has_value());
 
             auto result_ids = result.value()->GetIds();
             float e2e_recall = calc_recall_vs_gt(result_ids, k, k);
             e2e_recalls.push_back(e2e_recall);
+            e2e_latencies.push_back(e2e_latency);
         }
 
-        printf("[LEMUR-ratio%.1f] Search time: %.3f ms, Recall: ", ann_ratio, total_search_time * 1000);
+        printf("[LEMUR-ratio%.1f] Recall: ", ann_ratio);
         for (size_t i = 0; i < topk_values.size(); ++i) {
-            printf("@%d=%.1f%% ", topk_values[i], recalls[i] * 100);
+            printf("@%d=%.1f%% (%.2fms) ", topk_values[i], recalls[i] * 100, math_latencies[i]);
         }
         printf("\n");
         printf("                 E2E Recall: ");
         for (size_t i = 0; i < e2e_topk_values.size(); ++i) {
-            printf("@%d=%.1f%% ", e2e_topk_values[i], e2e_recalls[i] * 100);
+            printf("@%d=%.1f%% (%.2fms) ", e2e_topk_values[i], e2e_recalls[i] * 100, e2e_latencies[i]);
         }
         printf("\n");
         fflush(stdout);
 
         char name[32];
         snprintf(name, sizeof(name), "LEMUR (ratio=%.1f)", ann_ratio);
-        all_results.push_back({name, ann_ratio, idx == 0 ? lemur_build_time : 0, total_search_time, recalls, e2e_recalls});
+        all_results.push_back({name, ann_ratio, idx == 0 ? lemur_build_time : 0, total_search_time, recalls, math_latencies, e2e_recalls, e2e_latencies});
     }
 
     // ========== Summary ==========
-    printf("\n=====================================================================================================\n");
-    printf("                              %s: Math Recall                                           \n",
+    printf("\n");
+    // Calculate separator length: 25 (strategy) + 12 (build time) + (8 + 9) * topk_values.size()
+    int math_separator_len = 25 + 12 + (8 + 9) * (int)topk_values.size();
+    for (int i = 0; i < math_separator_len; ++i) printf("=");
+    printf("\n");
+    printf("                              %s: Math Recall (with Latency)                                           \n",
            dataset_name.c_str());
-    printf("=====================================================================================================\n");
+    for (int i = 0; i < math_separator_len; ++i) printf("=");
+    printf("\n");
 
-    // Header
-    printf("| Strategy                | Build Time | Search Time |");
+    // Header with R@K and Latency@K pairs
+    printf("| Strategy                | Build Time |");
     for (int32_t k : topk_values) {
-        printf(" R@%-3d |", k);
+        printf(" R@%-3d | Lat@%-2d |", k, k);
     }
     printf("\n");
 
-    printf("|-------------------------|------------|-------------|");
+    printf("|-------------------------|------------|");
     for (size_t i = 0; i < topk_values.size(); ++i) {
-        printf("-------|");
+        printf("-------|--------|");
     }
     printf("\n");
 
-    // BruteForce row
-    printf("| BruteForce              | %10s | %9.2f s |", "-", bf_time);
+    // BruteForce row (no individual latency for BF)
+    printf("| BruteForce              | %10s |", "-");
     for (size_t i = 0; i < topk_values.size(); ++i) {
-        printf(" %4.1f%% |", 100.0f);
+        printf(" %4.1f%% |      - |", 100.0f);
     }
     printf("\n");
 
-    // All results
+    // All results with individual latencies
     for (const auto& res : all_results) {
         if (res.build_time > 0) {
-            printf("| %-23s | %8.2f s | %9.2f ms |", res.name.c_str(), res.build_time, res.search_time * 1000);
+            printf("| %-23s | %8.2f s |", res.name.c_str(), res.build_time);
         } else {
-            printf("| %-23s | %10s | %9.2f ms |", res.name.c_str(), "-", res.search_time * 1000);
+            printf("| %-23s | %10s |", res.name.c_str(), "-");
         }
         for (size_t i = 0; i < topk_values.size(); ++i) {
-            printf(" %4.1f%% |", res.recalls[i] * 100);
+            if (i < res.math_latencies.size()) {
+                printf(" %4.1f%% | %6.2fms |", res.recalls[i] * 100, res.math_latencies[i]);
+            } else {
+                printf(" %4.1f%% |      - |", res.recalls[i] * 100);
+            }
         }
         printf("\n");
     }
 
-    printf("=====================================================================================================\n");
-    printf("Note: R@K = Recall at top-K, per-query averaged, compared to BruteForce MaxSim\n\n");
+    for (int i = 0; i < math_separator_len; ++i) printf("=");
+    printf("\n");
+    printf("Note: R@K = Recall at top-K, per-query averaged, compared to BruteForce MaxSim, Lat@K = Avg latency per query (ms)\n\n");
 
     // ========== E2E Recall Summary ==========
-    printf("=====================================================================================================\n");
-    printf("                              %s: E2E Recall                                            \n",
+    printf("==========================================================================================================================================\n");
+    printf("                              %s: E2E Recall (with Latency)                                            \n",
            dataset_name.c_str());
-    printf("=====================================================================================================\n");
+    printf("==========================================================================================================================================\n");
 
-    // Header
-    printf("| Strategy                | Build Time | Search Time |");
+    // Header with R@K and Latency@K pairs
+    printf("| Strategy                | Build Time |");
     for (int32_t k : e2e_topk_values) {
-        printf(" R@%-3d |", k);
+        printf(" R@%-3d | Lat@%-2d |", k, k);
     }
     printf("\n");
 
-    printf("|-------------------------|------------|-------------|");
+    printf("|-------------------------|------------|");
     for (size_t i = 0; i < e2e_topk_values.size(); ++i) {
-        printf("-------|");
+        printf("-------|--------|");
     }
     printf("\n");
 
-    // BruteForce row
-    printf("| BruteForce              | %10s | %9.2f s |", "-", bf_time);
+    // BruteForce row (no individual latency for BF)
+    printf("| BruteForce              | %10s |", "-");
     for (size_t i = 0; i < e2e_topk_values.size(); ++i) {
-        printf(" %4.1f%% |", bf_e2e_recalls[i] * 100);
+        printf(" %4.1f%% |      - |", bf_e2e_recalls[i] * 100);
     }
     printf("\n");
 
-    // All results
+    // All results with individual latencies
     for (const auto& res : all_results) {
         if (res.build_time > 0) {
-            printf("| %-23s | %8.2f s | %9.2f ms |", res.name.c_str(), res.build_time, res.search_time * 1000);
+            printf("| %-23s | %8.2f s |", res.name.c_str(), res.build_time);
         } else {
-            printf("| %-23s | %10s | %9.2f ms |", res.name.c_str(), "-", res.search_time * 1000);
+            printf("| %-23s | %10s |", res.name.c_str(), "-");
         }
         for (size_t i = 0; i < e2e_topk_values.size(); ++i) {
-            printf(" %4.1f%% |", res.e2e_recalls[i] * 100);
+            if (i < res.e2e_latencies.size()) {
+                printf(" %4.1f%% | %6.2fms |", res.e2e_recalls[i] * 100, res.e2e_latencies[i]);
+            } else {
+                printf(" %4.1f%% |      - |", res.e2e_recalls[i] * 100);
+            }
         }
         printf("\n");
     }
 
-    printf("=====================================================================================================\n");
-    printf("Note: R@K = Recall at top-K, per-query averaged, compared to Ground Truth annotations\n\n");
+    printf("==========================================================================================================================================\n");
+    printf("Note: R@K = E2E Recall at top-K (found GT / total GT), Lat@K = Avg latency per query (ms)\n\n");
 
     // ========== Dataset Info ==========
     printf("Dataset: %s - %d docs, %ld total vectors, dim=%d, avg %.1f vectors/doc\n", dataset_name.c_str(), num_docs,
