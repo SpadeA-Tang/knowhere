@@ -10,15 +10,18 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -36,7 +39,7 @@ namespace {
 // ============================================================================
 // Configuration: Control test behavior
 // ============================================================================
-constexpr int32_t MAX_DOCS_TO_LOAD = 10000;   // Hard-coded limit on documents
+constexpr int32_t MAX_DOCS_TO_LOAD = 5000;    // Hard-coded limit on documents (matches random sampling default)
 constexpr int32_t MAX_QUERIES_TO_LOAD = 100;  // Hard-coded limit on queries
 constexpr bool SKIP_DIRECT_TEST = false;      // Set to true to skip Direct strategy (it's slow)
 
@@ -55,8 +58,6 @@ struct EmbListData {
     int64_t num_docs = 0;
     int64_t total_vectors = 0;
 
-    // Load from JSONL file format
-    // Each line: {"pid": int, "text": str, "chunks": [{"pos": int, "emb": [float, ...]}, ...]}
     bool
     LoadFromJsonl(const std::string& jsonl_path, int32_t max_docs) {
         std::ifstream file(jsonl_path);
@@ -65,63 +66,116 @@ struct EmbListData {
             return false;
         }
 
+        // Phase 1: Read all lines into memory
+        printf("Reading JSONL file into memory...\n");
+        std::vector<std::string> lines;
+        lines.reserve(max_docs);
         std::string line;
-        int64_t doc_count = 0;
+        while (std::getline(file, line) && (int32_t)lines.size() < max_docs) {
+            if (!line.empty()) {
+                lines.push_back(std::move(line));
+            }
+        }
+        file.close();
+        printf("Read %zu lines, parsing with multiple threads...\n", lines.size());
 
+        // Phase 2: Parse in parallel
+        int num_threads = std::max(1, (int)std::thread::hardware_concurrency());
+        int64_t total_lines = lines.size();
+        int64_t chunk_size = (total_lines + num_threads - 1) / num_threads;
+
+        struct ParsedDoc {
+            std::vector<float> vecs;
+            int32_t num_chunks = 0;
+            int32_t dim = 0;
+        };
+
+        std::vector<std::vector<ParsedDoc>> thread_results(num_threads);
+
+        auto parse_worker = [&](int tid) {
+            int64_t start = tid * chunk_size;
+            int64_t end = std::min(start + chunk_size, total_lines);
+            if (start >= end) return;
+            auto& results = thread_results[tid];
+            results.reserve(end - start);
+
+            for (int64_t i = start; i < end; ++i) {
+                try {
+                    auto json = nlohmann::json::parse(lines[i]);
+                    const auto& chunks = json["chunks"];
+
+                    ParsedDoc doc;
+                    doc.num_chunks = chunks.size();
+
+                    for (const auto& chunk : chunks) {
+                        const auto& emb = chunk["emb"];
+                        if (doc.dim == 0) {
+                            doc.dim = static_cast<int32_t>(emb.size());
+                        }
+                        for (const auto& val : emb) {
+                            doc.vecs.push_back(val.get<float>());
+                        }
+                    }
+                    results.push_back(std::move(doc));
+                } catch (const std::exception& e) {
+                    printf("Error parsing line %ld: %s\n", i, e.what());
+                }
+            }
+        };
+
+        std::vector<std::thread> threads;
+        for (int t = 0; t < num_threads; ++t) {
+            threads.emplace_back(parse_worker, t);
+        }
+        for (auto& t : threads) {
+            t.join();
+        }
+
+        // Free lines to reclaim memory before merge
+        { std::vector<std::string>().swap(lines); }
+
+        // Phase 3: Merge results in order
         offsets.clear();
         offsets.push_back(0);
 
-        while (std::getline(file, line) && doc_count < max_docs) {
-            if (line.empty())
-                continue;
-
-            try {
-                auto json = nlohmann::json::parse(line);
-                const auto& chunks = json["chunks"];
-
-                for (const auto& chunk : chunks) {
-                    const auto& emb = chunk["emb"];
-                    if (dim == 0) {
-                        dim = static_cast<int32_t>(emb.size());
-                    }
-
-                    for (const auto& val : emb) {
-                        vectors.push_back(val.get<float>());
-                    }
-                }
-
-                offsets.push_back(offsets.back() + chunks.size());
-                doc_count++;
-
-                if (doc_count % 1000 == 0) {
-                    printf("Loaded %ld documents...\n", doc_count);
-                }
-            } catch (const std::exception& e) {
-                printf("Error parsing line %ld: %s\n", doc_count, e.what());
-                continue;
+        size_t total_floats = 0;
+        size_t total_docs_parsed = 0;
+        for (const auto& tr : thread_results) {
+            for (const auto& doc : tr) {
+                total_floats += doc.vecs.size();
+                total_docs_parsed++;
             }
         }
+        vectors.reserve(total_floats);
 
-        file.close();
+        for (auto& tr : thread_results) {
+            for (auto& doc : tr) {
+                if (dim == 0) {
+                    dim = doc.dim;
+                }
+                vectors.insert(vectors.end(), doc.vecs.begin(), doc.vecs.end());
+                offsets.push_back(offsets.back() + doc.num_chunks);
+                std::vector<float>().swap(doc.vecs);
+            }
+            std::vector<ParsedDoc>().swap(tr);
+        }
 
-        num_docs = doc_count;
+        num_docs = total_docs_parsed;
         total_vectors = offsets.back();
 
-        printf("Loaded %ld docs, %ld vectors, dim=%d from JSONL\n", num_docs, total_vectors, dim);
+        printf("Loaded %ld docs, %ld vectors, dim=%d from JSONL (%d threads)\n", num_docs, total_vectors, dim,
+               num_threads);
         return true;
     }
 
     knowhere::DataSetPtr
     ToDataSet() const {
-        float* data = new float[vectors.size()];
-        std::memcpy(data, vectors.data(), vectors.size() * sizeof(float));
-
         size_t* ofs = new size_t[offsets.size()];
         std::memcpy(ofs, offsets.data(), offsets.size() * sizeof(size_t));
 
-        auto ds = knowhere::GenDataSet(total_vectors, dim, data);
+        auto ds = knowhere::GenDataSet(total_vectors, dim, vectors.data());
         ds->Set(knowhere::meta::EMB_LIST_OFFSET, static_cast<const size_t*>(ofs));
-        ds->SetIsOwner(true);
+        ds->SetIsOwner(false);
         return ds;
     }
 
@@ -154,7 +208,9 @@ struct EmbListData {
 struct QueryDataWithGT {
     std::vector<float> vectors;
     std::vector<size_t> offsets;
-    std::vector<std::vector<int64_t>> gt_pids;  // Ground truth doc IDs per query
+    std::vector<std::vector<int64_t>> gt_pids;                  // Ground truth doc IDs per query
+    std::vector<std::unordered_map<int64_t, int>> gt_rels;     // doc_id -> relevance grade (graded)
+    bool has_graded_relevance = false;
     int32_t dim = 0;
     int64_t num_queries = 0;
     int64_t total_vectors = 0;
@@ -167,57 +223,112 @@ struct QueryDataWithGT {
             return false;
         }
 
+        std::vector<std::string> lines;
+        lines.reserve(max_queries);
         std::string line;
-        int64_t query_count = 0;
+        while (std::getline(file, line) && (int32_t)lines.size() < max_queries) {
+            if (!line.empty()) {
+                lines.push_back(std::move(line));
+            }
+        }
+        file.close();
+
+        int num_threads = std::min((int)std::thread::hardware_concurrency(), (int)lines.size());
+        num_threads = std::max(1, num_threads);
+        int64_t total_lines = lines.size();
+        int64_t chunk_size = (total_lines + num_threads - 1) / num_threads;
+
+        struct ParsedQuery {
+            std::vector<float> vecs;
+            int32_t num_chunks = 0;
+            int32_t dim = 0;
+            std::vector<int64_t> gt;
+            std::unordered_map<int64_t, int> rels;
+        };
+
+        std::vector<std::vector<ParsedQuery>> thread_results(num_threads);
+
+        auto parse_worker = [&](int tid) {
+            int64_t start = tid * chunk_size;
+            int64_t end = std::min(start + chunk_size, total_lines);
+            if (start >= end) return;
+            auto& results = thread_results[tid];
+            results.reserve(end - start);
+
+            for (int64_t i = start; i < end; ++i) {
+                try {
+                    auto json = nlohmann::json::parse(lines[i]);
+                    const auto& chunks = json["chunks"];
+
+                    ParsedQuery q;
+                    q.num_chunks = chunks.size();
+
+                    for (const auto& chunk : chunks) {
+                        const auto& emb = chunk["emb"];
+                        if (q.dim == 0) {
+                            q.dim = static_cast<int32_t>(emb.size());
+                        }
+                        for (const auto& val : emb) {
+                            q.vecs.push_back(val.get<float>());
+                        }
+                    }
+
+                    if (json.contains("gt_pids")) {
+                        for (const auto& pid : json["gt_pids"]) {
+                            q.gt.push_back(pid.get<int64_t>());
+                        }
+                    }
+                    if (json.contains("gt_rels")) {
+                        for (auto& [key, val] : json["gt_rels"].items()) {
+                            q.rels[std::stoll(key)] = val.get<int>();
+                        }
+                    } else {
+                        for (auto pid : q.gt) {
+                            q.rels[pid] = 1;
+                        }
+                    }
+                    results.push_back(std::move(q));
+                } catch (const std::exception& e) {
+                    printf("Error parsing query line %ld: %s\n", i, e.what());
+                }
+            }
+        };
+
+        std::vector<std::thread> threads;
+        for (int t = 0; t < num_threads; ++t) {
+            threads.emplace_back(parse_worker, t);
+        }
+        for (auto& t : threads) {
+            t.join();
+        }
 
         offsets.clear();
         offsets.push_back(0);
         gt_pids.clear();
+        gt_rels.clear();
 
-        while (std::getline(file, line) && query_count < max_queries) {
-            if (line.empty())
-                continue;
-
-            try {
-                auto json = nlohmann::json::parse(line);
-                const auto& chunks = json["chunks"];
-
-                for (const auto& chunk : chunks) {
-                    const auto& emb = chunk["emb"];
-                    if (dim == 0) {
-                        dim = static_cast<int32_t>(emb.size());
-                    }
-                    for (const auto& val : emb) {
-                        vectors.push_back(val.get<float>());
-                    }
+        bool found_graded = false;
+        for (const auto& tr : thread_results) {
+            for (const auto& q : tr) {
+                if (dim == 0) {
+                    dim = q.dim;
                 }
-
-                offsets.push_back(offsets.back() + chunks.size());
-
-                // Load ground truth pids
-                std::vector<int64_t> query_gt;
-                if (json.contains("gt_pids")) {
-                    for (const auto& pid : json["gt_pids"]) {
-                        query_gt.push_back(pid.get<int64_t>());
-                    }
+                vectors.insert(vectors.end(), q.vecs.begin(), q.vecs.end());
+                offsets.push_back(offsets.back() + q.num_chunks);
+                gt_pids.push_back(q.gt);
+                gt_rels.push_back(q.rels);
+                for (const auto& [id, rel] : q.rels) {
+                    if (rel > 1) found_graded = true;
                 }
-                gt_pids.push_back(query_gt);
-
-                query_count++;
-            } catch (const std::exception& e) {
-                printf("Error parsing line %ld: %s\n", query_count, e.what());
-                continue;
             }
         }
+        has_graded_relevance = found_graded;
 
-        file.close();
-
-        num_queries = query_count;
+        num_queries = gt_pids.size();
         total_vectors = offsets.back();
 
         printf("Loaded %ld queries, %ld vectors, dim=%d from JSONL\n", num_queries, total_vectors, dim);
 
-        // Print GT stats
         int64_t total_gt = 0, min_gt = INT64_MAX, max_gt = 0;
         for (const auto& gt : gt_pids) {
             total_gt += gt.size();
@@ -225,21 +336,21 @@ struct QueryDataWithGT {
             max_gt = std::max(max_gt, (int64_t)gt.size());
         }
         printf("GT per query: min=%ld, max=%ld, avg=%.1f\n", min_gt, max_gt, (double)total_gt / num_queries);
+        if (has_graded_relevance) {
+            printf("Graded relevance: YES (nDCG will use gain=2^rel-1)\n");
+        }
 
         return true;
     }
 
     knowhere::DataSetPtr
     ToDataSet() const {
-        float* data = new float[vectors.size()];
-        std::memcpy(data, vectors.data(), vectors.size() * sizeof(float));
-
         size_t* ofs = new size_t[offsets.size()];
         std::memcpy(ofs, offsets.data(), offsets.size() * sizeof(size_t));
 
-        auto ds = knowhere::GenDataSet(total_vectors, dim, data);
+        auto ds = knowhere::GenDataSet(total_vectors, dim, vectors.data());
         ds->Set(knowhere::meta::EMB_LIST_OFFSET, static_cast<const size_t*>(ofs));
-        ds->SetIsOwner(true);
+        ds->SetIsOwner(false);
         return ds;
     }
 
@@ -310,6 +421,8 @@ TEST_CASE("LoTTE ColBERT: Direct vs MUVERA", "[lotte_emb_list]") {
     const int64_t total_vectors = doc_data.total_vectors;
     const int32_t num_queries = query_data.num_queries;
 
+
+
     // Multiple topk values for evaluation
     const std::vector<int32_t> topk_values = {10, 20, 50};
     const int32_t max_topk = *std::max_element(topk_values.begin(), topk_values.end());
@@ -328,8 +441,8 @@ TEST_CASE("LoTTE ColBERT: Direct vs MUVERA", "[lotte_emb_list]") {
     base_conf[knowhere::meta::DIM] = dim;
     base_conf[knowhere::meta::TOPK] = max_topk;
     base_conf[knowhere::indexparam::HNSW_M] = 16;
-    base_conf[knowhere::indexparam::EFCONSTRUCTION] = 100;
-    base_conf[knowhere::indexparam::EF] = 64;
+    base_conf[knowhere::indexparam::EFCONSTRUCTION] = 200;
+    base_conf[knowhere::indexparam::EF] = std::max(128, max_topk * 2);
     base_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = 2.0f;
 
     auto version = GenTestEmbListVersionList();
@@ -419,6 +532,60 @@ TEST_CASE("LoTTE ColBERT: Direct vs MUVERA", "[lotte_emb_list]") {
         return valid_queries > 0 ? total_recall / valid_queries : 0.0f;
     };
 
+    // nDCG@k calculation vs GT (per-query average, supports graded relevance)
+    auto calc_ndcg_vs_gt = [&](const int64_t* result_ids, int32_t k) {
+        float total_ndcg = 0.0f;
+        int valid_queries = 0;
+        for (int q = 0; q < num_queries; ++q) {
+            const auto& rels = query_data.gt_rels[q];
+            if (rels.empty())
+                continue;
+            double dcg = 0.0;
+            for (int i = 0; i < k; ++i) {
+                int64_t doc_id = result_ids[q * max_topk + i];
+                auto it = rels.find(doc_id);
+                if (doc_id >= 0 && it != rels.end()) {
+                    dcg += (std::pow(2.0, it->second) - 1.0) / std::log2(i + 2.0);
+                }
+            }
+            std::vector<int> sorted_rels;
+            sorted_rels.reserve(rels.size());
+            for (const auto& [id, rel] : rels) {
+                sorted_rels.push_back(rel);
+            }
+            std::sort(sorted_rels.rbegin(), sorted_rels.rend());
+            double idcg = 0.0;
+            int ideal_count = std::min((int)sorted_rels.size(), k);
+            for (int i = 0; i < ideal_count; ++i) {
+                idcg += (std::pow(2.0, sorted_rels[i]) - 1.0) / std::log2(i + 2.0);
+            }
+            total_ndcg += idcg > 0 ? (float)(dcg / idcg) : 0.0f;
+            valid_queries++;
+        }
+        return valid_queries > 0 ? total_ndcg / valid_queries : 0.0f;
+    };
+
+    // MRR@k calculation vs GT (per-query average)
+    auto calc_mrr_vs_gt = [&](const int64_t* result_ids, int32_t k) {
+        float total_rr = 0.0f;
+        int valid_queries = 0;
+        for (int q = 0; q < num_queries; ++q) {
+            const auto& gt = query_data.gt_pids[q];
+            if (gt.empty())
+                continue;
+            std::unordered_set<int64_t> gt_set(gt.begin(), gt.end());
+            for (int i = 0; i < k; ++i) {
+                int64_t doc_id = result_ids[q * max_topk + i];
+                if (doc_id >= 0 && gt_set.count(doc_id) > 0) {
+                    total_rr += 1.0f / (i + 1);
+                    break;
+                }
+            }
+            valid_queries++;
+        }
+        return valid_queries > 0 ? total_rr / valid_queries : 0.0f;
+    };
+
     // Recall calculation vs BruteForce results (per-query average)
     auto calc_recall_vs_bf = [&](const int64_t* result_ids, const int64_t* bf_ids, int32_t k) {
         if (bf_ids == nullptr)
@@ -478,13 +645,14 @@ TEST_CASE("LoTTE ColBERT: Direct vs MUVERA", "[lotte_emb_list]") {
         bf_result_ds = bf_result.value();
         bf_ids = bf_result_ds->GetIds();
 
-        // Calculate GT recall at each topk
+        // Calculate GT metrics at each topk
         printf("[BruteForce] Recall (vs GT): ");
         for (size_t i = 0; i < topk_values.size(); ++i) {
             bf_recalls_vs_gt[i] = calc_recall_vs_gt(bf_ids, topk_values[i]);
             printf("@%d=%.1f%% ", topk_values[i], bf_recalls_vs_gt[i] * 100);
         }
         printf("\n");
+        printf("[BruteForce] nDCG@10=%.4f, MRR@10=%.4f\n", calc_ndcg_vs_gt(bf_ids, 10), calc_mrr_vs_gt(bf_ids, 10));
         fflush(stdout);
     }
 
@@ -528,6 +696,8 @@ TEST_CASE("LoTTE ColBERT: Direct vs MUVERA", "[lotte_emb_list]") {
             printf("@%d=%.1f%% ", topk_values[i], direct_recalls[i] * 100);
         }
         printf("\n");
+        printf("[Direct] nDCG@10=%.4f, MRR@10=%.4f\n", calc_ndcg_vs_gt(direct_ids, 10),
+               calc_mrr_vs_gt(direct_ids, 10));
         fflush(stdout);
     }
 
@@ -545,6 +715,8 @@ TEST_CASE("LoTTE ColBERT: Direct vs MUVERA", "[lotte_emb_list]") {
         double build_time;
         double search_time;
         std::vector<float> recalls;  // recall at each topk
+        float ndcg10 = 0.0f;        // nDCG@10
+        float mrr10 = 0.0f;         // MRR@10
     };
     std::vector<MuveraResult> muvera_results;
 
@@ -585,16 +757,18 @@ TEST_CASE("LoTTE ColBERT: Direct vs MUVERA", "[lotte_emb_list]") {
 
         auto muvera_ids = muvera_result.value()->GetIds();
         auto recalls = calc_recalls_vs_bf(muvera_ids, bf_ids);
+        float ndcg10 = calc_ndcg_vs_gt(muvera_ids, 10);
+        float mrr10 = calc_mrr_vs_gt(muvera_ids, 10);
         if (bf_ids != nullptr) {
             printf("[MUVERA-%d-%d] Recall (vs BF): ", num_proj, num_rep);
             for (size_t i = 0; i < topk_values.size(); ++i) {
                 printf("@%d=%.1f%% ", topk_values[i], recalls[i] * 100);
             }
-            printf("\n");
+            printf("  nDCG@10=%.4f MRR@10=%.4f\n", ndcg10, mrr10);
         }
         fflush(stdout);
 
-        muvera_results.push_back({num_proj, num_rep, build_time, search_time, recalls});
+        muvera_results.push_back({num_proj, num_rep, build_time, search_time, recalls, ndcg10, mrr10});
     }
 
     // ========== Summary ==========
@@ -646,11 +820,11 @@ TEST_CASE("LoTTE ColBERT: Direct vs MUVERA", "[lotte_emb_list]") {
     printf("Dataset: %d docs, %ld total vectors, avg %.1f vectors/doc\n", num_docs, total_vectors,
            (float)total_vectors / num_docs);
     if (!SKIP_DIRECT_TEST) {
-        printf("BruteForce Recall (vs official GT): ");
+        printf("BruteForce E2E (vs official GT): ");
         for (size_t i = 0; i < topk_values.size(); ++i) {
-            printf("@%d=%.1f%% ", topk_values[i], bf_recalls_vs_gt[i] * 100);
+            printf("R@%d=%.1f%%  ", topk_values[i], bf_recalls_vs_gt[i] * 100);
         }
-        printf("\n");
+        printf("nDCG@10=%.4f MRR@10=%.4f\n", calc_ndcg_vs_gt(bf_ids, 10), calc_mrr_vs_gt(bf_ids, 10));
     }
     printf("\nNote: R@K = Recall at top-K, per-query averaged, compared to BruteForce MaxSim\n");
     fflush(stdout);

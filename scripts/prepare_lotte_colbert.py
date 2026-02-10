@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Prepare LoTTE ColBERT embeddings for knowhere testing.
+Prepare LoTTE BGE-M3 multi-vector embeddings for knowhere testing.
 
 This script downloads LoTTE dataset, splits long documents into passages,
-encodes each passage with ColBERT, and merges all passage vectors into
-a single entity per document.
+encodes each passage with BGE-M3 (ColBERT-style multi-vector mode), and
+merges all passage vectors into a single entity per document.
 
 Usage:
-    # Encode LoTTE data with ColBERT (requires GPU)
+    # Encode LoTTE data with BGE-M3 (requires GPU)
     python scripts/prepare_lotte_colbert.py --domain science --max-docs 1000
 
     # Generate synthetic long-document data (for quick testing)
@@ -15,7 +15,7 @@ Usage:
 
 Requirements:
     pip install torch --index-url https://download.pytorch.org/whl/cu118
-    pip install colbert-ai transformers datasets tqdm numpy
+    pip install FlagEmbedding transformers datasets tqdm numpy
 """
 
 import argparse
@@ -30,18 +30,16 @@ DEFAULT_MAX_QUERIES = 100
 DEFAULT_OUTPUT_DIR = "."
 DEFAULT_DOMAIN = "science"  # science, lifestyle, writing, recreation, technology
 
-# ColBERT max tokens per passage
-COLBERT_DOC_MAXLEN = 180
+# BGE-M3 supports up to 8192 tokens, but we split long docs into manageable passages
+BGE_M3_MAX_LENGTH = 512
 
 
-def split_document_into_passages(text: str, max_tokens: int = COLBERT_DOC_MAXLEN) -> List[str]:
+def split_document_into_passages(text: str, words_per_passage: int = 300) -> List[str]:
     """
-    Split a long document into passages of max_tokens.
+    Split a long document into passages.
     Uses simple word-based splitting (approximation of token count).
     """
     words = text.split()
-    # Approximate: 1 word ~ 1.3 tokens on average
-    words_per_passage = int(max_tokens / 1.3)
 
     passages = []
     for i in range(0, len(words), words_per_passage):
@@ -56,27 +54,24 @@ def split_document_into_passages(text: str, max_tokens: int = COLBERT_DOC_MAXLEN
     return passages
 
 
-def encode_passages_with_colbert(passages: List[str], checkpoint, batch_size: int = 32) -> np.ndarray:
+def encode_passages_with_bgem3(passages: List[str], model, batch_size: int = 12,
+                                max_length: int = 512) -> np.ndarray:
     """Encode passages and return concatenated vectors."""
-    import torch
-
     all_vectors = []
 
-    for i in range(0, len(passages), batch_size):
-        batch = passages[i:i + batch_size]
-        with torch.no_grad():
-            embs = checkpoint.docFromText(batch)
+    output = model.encode(passages, batch_size=batch_size, max_length=max_length,
+                          return_colbert_vecs=True)
 
-            for emb in embs:
-                # Remove padding (zero vectors)
-                norms = torch.norm(emb, dim=-1)
-                mask = norms > 1e-6
-                valid_emb = emb[mask].cpu().numpy()
+    for vecs in output['colbert_vecs']:
+        # Filter out near-zero vectors (safety check)
+        norms = np.linalg.norm(vecs, axis=-1)
+        mask = norms > 1e-6
+        valid = vecs[mask]
 
-                if len(valid_emb) == 0:
-                    valid_emb = emb[0:1].cpu().numpy()
+        if len(valid) == 0:
+            valid = vecs[0:1]
 
-                all_vectors.append(valid_emb)
+        all_vectors.append(valid)
 
     # Concatenate all passage vectors into one array
     return np.vstack(all_vectors).astype(np.float32)
@@ -121,26 +116,15 @@ def load_tsv_queries(tsv_path: str, max_queries: int) -> List[Tuple[str, str]]:
 
 
 def download_and_encode_lotte(domain: str, max_docs: int, max_queries: int, output_dir: Path):
-    """Load LoTTE from local TSV files and encode with ColBERT."""
-    import torch
+    """Load LoTTE from local TSV files and encode with BGE-M3."""
     from tqdm import tqdm
 
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+    # Load BGE-M3 model
+    print("\n=== Loading BGE-M3 model ===")
+    from FlagEmbedding import BGEM3FlagModel
 
-    # Load ColBERT model
-    print("\n=== Loading ColBERT model ===")
-    from colbert.infra import ColBERTConfig
-    from colbert.modeling.checkpoint import Checkpoint
-
-    config = ColBERTConfig(
-        doc_maxlen=COLBERT_DOC_MAXLEN,
-        query_maxlen=32,
-    )
-    checkpoint = Checkpoint("colbert-ir/colbertv2.0", colbert_config=config)
-    print("ColBERT model loaded")
+    model = BGEM3FlagModel('/home/spadea/models/bge-m3', use_fp16=True)
+    print("BGE-M3 model loaded")
 
     # Load from local TSV files
     # Expected path: lotte/{domain}/dev/collection.tsv
@@ -161,40 +145,42 @@ def download_and_encode_lotte(domain: str, max_docs: int, max_queries: int, outp
     raw_docs = load_tsv_documents(str(collection_path), max_docs)
     print(f"Loaded {len(raw_docs)} documents from TSV")
 
-    # Process documents
-    print(f"\n=== Encoding documents with ColBERT ===")
-    documents = []
+    # Process documents (streaming write)
+    print(f"\n=== Encoding documents with BGE-M3 ===")
+    doc_path = output_dir / f"lotte_{domain}_docs.jsonl"
+    doc_vec_counts = []
+    num_docs = 0
 
-    for i, (doc_id, text) in enumerate(tqdm(raw_docs, desc="Processing docs")):
-        if not text:
-            continue
+    with open(doc_path, 'w') as f:
+        for i, (doc_id, text) in enumerate(tqdm(raw_docs, desc="Processing docs")):
+            if not text:
+                continue
 
-        # Split into passages
-        passages = split_document_into_passages(text)
+            # Split into passages
+            passages = split_document_into_passages(text)
 
-        # Encode all passages
-        vectors = encode_passages_with_colbert(passages, checkpoint)
+            # Encode all passages
+            vectors = encode_passages_with_bgem3(passages, model, max_length=BGE_M3_MAX_LENGTH)
 
-        # Create document entry (same format as milvus_insert.1k.jsonl)
-        chunks = []
-        for j, vec in enumerate(vectors):
-            chunks.append({
-                "pos": j,
-                "emb": vec.tolist()
-            })
+            chunks = [{"pos": j, "emb": [round(float(x), 6) for x in vec]} for j, vec in enumerate(vectors)]
 
-        doc_entry = {
-            "pid": i,
-            "text": text[:500],  # Truncate text for storage
-            "chunks": chunks
-        }
-        documents.append(doc_entry)
+            entry = {
+                "pid": i,
+                "text": text[:500],
+                "chunks": chunks
+            }
+            f.write(json.dumps(entry) + '\n')
+            doc_vec_counts.append(len(chunks))
+            num_docs += 1
 
-        if (i + 1) % 100 == 0:
-            avg_vecs = np.mean([len(d['chunks']) for d in documents])
-            print(f"  Processed {i + 1} docs, avg vectors/doc: {avg_vecs:.1f}")
+            if (i + 1) % 100 == 0:
+                avg_vecs = np.mean(doc_vec_counts)
+                print(f"  Processed {i + 1} docs, avg vectors/doc: {avg_vecs:.1f}")
 
-    # Load and process queries
+    print(f"Saved {num_docs} docs to {doc_path}")
+    print(f"  File size: {os.path.getsize(doc_path) / 1e6:.1f} MB")
+
+    # Load and process queries (streaming write)
     print(f"\n=== Processing queries (max {max_queries}) ===")
     if queries_path.exists():
         raw_queries = load_tsv_queries(str(queries_path), max_queries)
@@ -202,32 +188,46 @@ def download_and_encode_lotte(domain: str, max_docs: int, max_queries: int, outp
         print(f"Loaded {len(queries)} queries from TSV")
     else:
         print(f"Queries file not found, using document prefixes")
-        queries = [doc['text'][:100] for doc in documents[:max_queries]]
+        # Read back first few docs from JSONL for query generation
+        queries = []
+        with open(doc_path, 'r') as f:
+            for j, line in enumerate(f):
+                if j >= max_queries:
+                    break
+                doc = json.loads(line)
+                queries.append(doc.get('text', '')[:100])
 
     # Encode queries
-    query_documents = []
-    for i, query in enumerate(tqdm(queries, desc="Encoding queries")):
-        with torch.no_grad():
-            embs = checkpoint.queryFromText([query])
-            emb = embs[0]
-            norms = torch.norm(emb, dim=-1)
+    query_path = output_dir / f"lotte_{domain}_queries.jsonl"
+    query_vec_counts = []
+
+    with open(query_path, 'w') as f:
+        for i, query in enumerate(tqdm(queries, desc="Encoding queries")):
+            output = model.encode([query], batch_size=1, max_length=BGE_M3_MAX_LENGTH,
+                                  return_colbert_vecs=True)
+            vecs = output['colbert_vecs'][0]
+
+            norms = np.linalg.norm(vecs, axis=-1)
             mask = norms > 1e-6
-            valid_emb = emb[mask].cpu().numpy()
+            valid = vecs[mask]
+            if len(valid) == 0:
+                valid = vecs[0:1]
 
-            if len(valid_emb) == 0:
-                valid_emb = emb[0:1].cpu().numpy()
+            chunks = [{"pos": j, "emb": [round(float(x), 6) for x in vec]} for j, vec in enumerate(valid)]
+            entry = {
+                "pid": i,
+                "text": query[:200],
+                "chunks": chunks
+            }
+            f.write(json.dumps(entry) + '\n')
+            query_vec_counts.append(len(chunks))
 
-        chunks = [{"pos": j, "emb": vec.tolist()} for j, vec in enumerate(valid_emb)]
-        query_documents.append({
-            "pid": i,
-            "text": query[:200],
-            "chunks": chunks
-        })
+    print(f"Saved {len(query_vec_counts)} queries to {query_path}")
 
-    return documents, query_documents
+    return doc_path, query_path, doc_vec_counts, query_vec_counts
 
 
-def generate_synthetic_long_docs(max_docs: int, max_queries: int, dim: int = 128):
+def generate_synthetic_long_docs(max_docs: int, max_queries: int, dim: int = 1024):
     """
     Generate synthetic long-document data with high variance in vector count.
     Simulates documents with 100-2000 vectors per document.
@@ -251,7 +251,7 @@ def generate_synthetic_long_docs(max_docs: int, max_queries: int, dim: int = 128
         vecs = base + 0.3 * np.random.randn(num_vecs, dim).astype(np.float32)
         vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
 
-        chunks = [{"pos": j, "emb": vec.tolist()} for j, vec in enumerate(vecs)]
+        chunks = [{"pos": j, "emb": [round(float(x), 6) for x in vec]} for j, vec in enumerate(vecs)]
 
         documents.append({
             "pid": i,
@@ -273,7 +273,7 @@ def generate_synthetic_long_docs(max_docs: int, max_queries: int, dim: int = 128
         vecs = base + 0.3 * np.random.randn(num_vecs, dim).astype(np.float32)
         vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
 
-        chunks = [{"pos": j, "emb": vec.tolist()} for j, vec in enumerate(vecs)]
+        chunks = [{"pos": j, "emb": [round(float(x), 6) for x in vec]} for j, vec in enumerate(vecs)]
 
         query_documents.append({
             "pid": i,
@@ -312,7 +312,7 @@ def print_statistics(documents: List[dict], name: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare LoTTE ColBERT data for long-document testing")
+    parser = argparse.ArgumentParser(description="Prepare LoTTE BGE-M3 data for long-document testing")
     parser.add_argument("--domain", type=str, default=DEFAULT_DOMAIN,
                         choices=["science", "lifestyle", "writing", "recreation", "technology"],
                         help=f"LoTTE domain (default: {DEFAULT_DOMAIN})")
@@ -323,9 +323,9 @@ def main():
     parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR,
                         help=f"Output directory (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--synthetic", action="store_true",
-                        help="Generate synthetic data instead of real ColBERT embeddings")
-    parser.add_argument("--dim", type=int, default=128,
-                        help="Dimension for synthetic data (default: 128)")
+                        help="Generate synthetic data instead of real BGE-M3 embeddings")
+    parser.add_argument("--dim", type=int, default=1024,
+                        help="Dimension for synthetic data (default: 1024)")
 
     args = parser.parse_args()
 
@@ -336,29 +336,35 @@ def main():
         documents, query_documents = generate_synthetic_long_docs(
             args.max_docs, args.max_queries, args.dim
         )
+
+        # Print statistics
+        print_statistics(documents, "Documents")
+        print_statistics(query_documents, "Queries")
+
+        # Save to JSONL
         output_name = "lotte_synthetic"
+        doc_path = output_dir / f"{output_name}_docs.jsonl"
+        query_path = output_dir / f"{output_name}_queries.jsonl"
+
+        print(f"\n=== Saving Data ===")
+        save_to_jsonl(documents, str(doc_path))
+        save_to_jsonl(query_documents, str(query_path))
     else:
-        documents, query_documents = download_and_encode_lotte(
+        doc_path, query_path, doc_vec_counts, query_vec_counts = download_and_encode_lotte(
             args.domain, args.max_docs, args.max_queries, output_dir
         )
-        output_name = f"lotte_{args.domain}"
 
-    # Print statistics
-    print_statistics(documents, "Documents")
-    print_statistics(query_documents, "Queries")
-
-    # Save to JSONL
-    doc_path = output_dir / f"{output_name}_docs.jsonl"
-    query_path = output_dir / f"{output_name}_queries.jsonl"
-
-    print(f"\n=== Saving Data ===")
-    save_to_jsonl(documents, str(doc_path))
-    save_to_jsonl(query_documents, str(query_path))
+        # Print statistics
+        print(f"\nDocument Statistics:")
+        print(f"  Documents: {len(doc_vec_counts)}")
+        print(f"  Vectors/doc: min={min(doc_vec_counts)}, max={max(doc_vec_counts)}, avg={np.mean(doc_vec_counts):.1f}")
+        print(f"\nQuery Statistics:")
+        print(f"  Queries: {len(query_vec_counts)}")
+        print(f"  Vectors/query: min={min(query_vec_counts)}, max={max(query_vec_counts)}, avg={np.mean(query_vec_counts):.1f}")
 
     print(f"\n=== Done! ===")
     print(f"Documents: {doc_path}")
     print(f"Queries: {query_path}")
-    print(f"\nTo use in test, update COLBERT_JSONL_PATH in test_emb_list_msmarco.cc")
 
 
 if __name__ == "__main__":
