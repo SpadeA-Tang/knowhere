@@ -41,24 +41,71 @@ namespace {
 // Configuration: Control test behavior
 // ============================================================================
 constexpr int32_t MAX_DOCS_TO_LOAD = 5000;    // Hard-coded limit on documents (matches random sampling default)
-constexpr int32_t MAX_QUERIES_TO_LOAD = 500;  // Hard-coded limit on queries
+constexpr int32_t MAX_QUERIES_TO_LOAD = 100;  // Hard-coded limit on queries
 constexpr bool SKIP_DIRECT_TEST = false;      // Set to true to skip Direct strategy (it's slow)
 
+// Helper to get env var with default value
+inline std::string
+GetEnvOr(const char* name, const std::string& default_val) {
+    const char* val = std::getenv(name);
+    return val ? std::string(val) : default_val;
+}
+
+// Model tag from environment (e.g., "colbertv2", "bgem3")
+// Usage: MODEL_TAG=colbertv2 ./knowhere_tests "[scifact_emb_list]"
+inline std::string
+GetModelTag() {
+    return GetEnvOr("MODEL_TAG", "gt");  // default "gt" for backward compatibility
+}
+
+// Build data file path: {dataset}_{model_tag}_{suffix}.jsonl
+inline std::string
+BuildDataPath(const std::string& dataset, const std::string& suffix) {
+    std::string model_tag = GetModelTag();
+    return dataset + "_" + model_tag + "_" + suffix + ".jsonl";
+}
+
 // MS MARCO data file paths (with official ground truth annotations)
-const std::string MSMARCO_DOCS_JSONL_PATH = "msmarco_gt_docs.jsonl";
-const std::string MSMARCO_QUERIES_JSONL_PATH = "msmarco_gt_queries.jsonl";
+// Can be overridden via environment: MSMARCO_DOCS_PATH, MSMARCO_QUERIES_PATH
+// Or use MODEL_TAG to auto-generate: MODEL_TAG=bgem3 -> msmarco_bgem3_docs.jsonl
+inline std::string GetMsmarcoDocsPath() {
+    return GetEnvOr("MSMARCO_DOCS_PATH", BuildDataPath("msmarco", "docs"));
+}
+inline std::string GetMsmarcoQueriesPath() {
+    return GetEnvOr("MSMARCO_QUERIES_PATH", BuildDataPath("msmarco", "queries"));
+}
 
 // LoTTE data file paths
-const std::string LOTTE_DOCS_JSONL_PATH = "lotte_science_gt_docs.jsonl";
-const std::string LOTTE_QUERIES_JSONL_PATH = "lotte_science_gt_queries.jsonl";
+inline std::string GetLotteDocsPath() {
+    return GetEnvOr("LOTTE_DOCS_PATH", BuildDataPath("lotte_science", "docs"));
+}
+inline std::string GetLotteQueriesPath() {
+    return GetEnvOr("LOTTE_QUERIES_PATH", BuildDataPath("lotte_science", "queries"));
+}
 
 // SciFact data file paths
-const std::string SCIFACT_DOCS_JSONL_PATH = "scifact_gt_docs.jsonl";
-const std::string SCIFACT_QUERIES_JSONL_PATH = "scifact_gt_queries.jsonl";
+inline std::string GetScifactDocsPath() {
+    return GetEnvOr("SCIFACT_DOCS_PATH", BuildDataPath("scifact", "docs"));
+}
+inline std::string GetScifactQueriesPath() {
+    return GetEnvOr("SCIFACT_QUERIES_PATH", BuildDataPath("scifact", "queries"));
+}
 
 // TREC-COVID data file paths (graded relevance: 0/1/2)
-const std::string TREC_COVID_DOCS_JSONL_PATH = "trec_covid_gt_docs.jsonl";
-const std::string TREC_COVID_QUERIES_JSONL_PATH = "trec_covid_gt_queries.jsonl";
+inline std::string GetTrecCovidDocsPath() {
+    return GetEnvOr("TREC_COVID_DOCS_PATH", BuildDataPath("trec_covid", "docs"));
+}
+inline std::string GetTrecCovidQueriesPath() {
+    return GetEnvOr("TREC_COVID_QUERIES_PATH", BuildDataPath("trec_covid", "queries"));
+}
+
+// DocVQA data file paths (multimodal: ColQwen2 multi-vector or Qwen3-VL-Embedding dense)
+inline std::string GetDocvqaDocsPath() {
+    return GetEnvOr("DOCVQA_DOCS_PATH", BuildDataPath("docvqa", "docs"));
+}
+inline std::string GetDocvqaQueriesPath() {
+    return GetEnvOr("DOCVQA_QUERIES_PATH", BuildDataPath("docvqa", "queries"));
+}
 
 // ============================================================================
 // EmbListData: Load and manage embedding list data
@@ -395,21 +442,26 @@ struct QueryDataWithGT {
 }  // namespace
 
 TEST_CASE("MS MARCO ColBERT: Direct vs MUVERA", "[msmarco_emb_list]") {
+    // Get data paths (can be overridden via MODEL_TAG or explicit env vars)
+    const std::string docs_path = GetMsmarcoDocsPath();
+    const std::string queries_path = GetMsmarcoQueriesPath();
+
     // Check if MS MARCO data files exist
     {
-        std::ifstream docs_file(MSMARCO_DOCS_JSONL_PATH);
-        std::ifstream queries_file(MSMARCO_QUERIES_JSONL_PATH);
+        std::ifstream docs_file(docs_path);
+        std::ifstream queries_file(queries_path);
 
         if (!docs_file.good() || !queries_file.good()) {
             printf("\n");
             printf("=============================================================\n");
             printf("MS MARCO data files not found. Please prepare the data first.\n");
             printf("Expected files:\n");
-            printf("  - %s\n", MSMARCO_DOCS_JSONL_PATH.c_str());
-            printf("  - %s\n", MSMARCO_QUERIES_JSONL_PATH.c_str());
+            printf("  - %s\n", docs_path.c_str());
+            printf("  - %s\n", queries_path.c_str());
             printf("\n");
             printf("Generate MS MARCO data with GT annotations:\n");
             printf("  python scripts/prepare_msmarco_with_gt.py --output-dir .\n");
+            printf("Or specify MODEL_TAG: MODEL_TAG=bgem3 ./knowhere_tests\n");
             printf("=============================================================\n");
             SKIP("MS MARCO data files not found");
             return;
@@ -417,14 +469,14 @@ TEST_CASE("MS MARCO ColBERT: Direct vs MUVERA", "[msmarco_emb_list]") {
     }
 
     // Load data
-    printf("\n=== Loading MS MARCO Data (with GT annotations) ===\n");
+    printf("\n=== Loading MS MARCO Data (model_tag=%s) ===\n", GetModelTag().c_str());
     EmbListData doc_data;
     QueryDataWithGT query_data;
 
-    REQUIRE(doc_data.LoadFromJsonl(MSMARCO_DOCS_JSONL_PATH, MAX_DOCS_TO_LOAD));
+    REQUIRE(doc_data.LoadFromJsonl(docs_path, MAX_DOCS_TO_LOAD));
     doc_data.PrintStats();
 
-    REQUIRE(query_data.LoadFromJsonl(MSMARCO_QUERIES_JSONL_PATH, MAX_QUERIES_TO_LOAD));
+    REQUIRE(query_data.LoadFromJsonl(queries_path, MAX_QUERIES_TO_LOAD));
     query_data.PrintStats();
 
     auto doc_ds = doc_data.ToDataSet();
@@ -809,21 +861,26 @@ TEST_CASE("MS MARCO ColBERT: Direct vs MUVERA", "[msmarco_emb_list]") {
 }
 
 TEST_CASE("MS MARCO ColBERT: Direct vs LEMUR", "[msmarco_emb_list_lemur]") {
+    // Get data paths (can be overridden via MODEL_TAG or explicit env vars)
+    const std::string docs_path = GetMsmarcoDocsPath();
+    const std::string queries_path = GetMsmarcoQueriesPath();
+
     // Check if MS MARCO data files exist
     {
-        std::ifstream docs_file(MSMARCO_DOCS_JSONL_PATH);
-        std::ifstream queries_file(MSMARCO_QUERIES_JSONL_PATH);
+        std::ifstream docs_file(docs_path);
+        std::ifstream queries_file(queries_path);
 
         if (!docs_file.good() || !queries_file.good()) {
             printf("\n");
             printf("=============================================================\n");
             printf("MS MARCO data files not found. Please prepare the data first.\n");
             printf("Expected files:\n");
-            printf("  - %s\n", MSMARCO_DOCS_JSONL_PATH.c_str());
-            printf("  - %s\n", MSMARCO_QUERIES_JSONL_PATH.c_str());
+            printf("  - %s\n", docs_path.c_str());
+            printf("  - %s\n", queries_path.c_str());
             printf("\n");
             printf("Generate MS MARCO data with GT annotations:\n");
             printf("  python scripts/prepare_msmarco_with_gt.py --output-dir .\n");
+            printf("Or specify MODEL_TAG: MODEL_TAG=bgem3 ./knowhere_tests\n");
             printf("=============================================================\n");
             SKIP("MS MARCO data files not found");
             return;
@@ -831,14 +888,14 @@ TEST_CASE("MS MARCO ColBERT: Direct vs LEMUR", "[msmarco_emb_list_lemur]") {
     }
 
     // Load data
-    printf("\n=== Loading MS MARCO Data (with GT annotations) ===\n");
+    printf("\n=== Loading MS MARCO Data (model_tag=%s) ===\n", GetModelTag().c_str());
     EmbListData doc_data;
     QueryDataWithGT query_data;
 
-    REQUIRE(doc_data.LoadFromJsonl(MSMARCO_DOCS_JSONL_PATH, MAX_DOCS_TO_LOAD));
+    REQUIRE(doc_data.LoadFromJsonl(docs_path, MAX_DOCS_TO_LOAD));
     doc_data.PrintStats();
 
-    REQUIRE(query_data.LoadFromJsonl(MSMARCO_QUERIES_JSONL_PATH, MAX_QUERIES_TO_LOAD));
+    REQUIRE(query_data.LoadFromJsonl(queries_path, MAX_QUERIES_TO_LOAD));
     query_data.PrintStats();
 
     auto doc_ds = doc_data.ToDataSet();
@@ -1132,7 +1189,9 @@ TEST_CASE("MS MARCO ColBERT: Direct vs LEMUR", "[msmarco_emb_list_lemur]") {
 // ============================================================================
 static void
 RunMuveraLemurComparison(const std::string& dataset_name, const std::string& docs_path, const std::string& queries_path,
-                         int32_t max_docs, int32_t max_queries) {
+                         int32_t max_docs, int32_t max_queries,
+                         const std::vector<int32_t>& custom_topk = {},
+                         const std::vector<int32_t>& custom_e2e_topk = {}) {
     // Check if data files exist
     {
         std::ifstream docs_file(docs_path);
@@ -1151,8 +1210,11 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
         }
     }
 
+    // Get model tag for display
+    const std::string model_tag = GetModelTag();
+
     // Load data
-    printf("\n=== Loading %s Data ===\n", dataset_name.c_str());
+    printf("\n=== Loading %s Data (model=%s) ===\n", dataset_name.c_str(), model_tag.c_str());
     EmbListData doc_data;
     QueryDataWithGT query_data;
 
@@ -1171,15 +1233,15 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
     const int32_t num_queries = std::min((int32_t)query_data.num_queries, max_queries);
 
     // Multiple topk values for evaluation
-    const std::vector<int32_t> topk_values = {50, 100};
-    const std::vector<int32_t> e2e_topk_values = {100};
+    const std::vector<int32_t> topk_values = custom_topk.empty() ? std::vector<int32_t>{50, 100} : custom_topk;
+    const std::vector<int32_t> e2e_topk_values = custom_e2e_topk.empty() ? std::vector<int32_t>{100} : custom_e2e_topk;
     const int32_t max_topk = *std::max_element(topk_values.begin(), topk_values.end());
 
     // ANN ratios to test
     const std::vector<float> ann_ratios = {3.0f, 4.0f, 5.0f};
 
     printf("\n=== Test Configuration ===\n");
-    printf("Dataset: %s\n", dataset_name.c_str());
+    printf("Dataset: %s, Model: %s\n", dataset_name.c_str(), model_tag.c_str());
     printf("Documents: %d, Total vectors: %ld, Dim: %d\n", num_docs, total_vectors, dim);
     printf("Queries: %d, TopK values: ", num_queries);
     for (size_t i = 0; i < topk_values.size(); ++i) {
@@ -1421,7 +1483,6 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
 
             // Search for E2E Recall (vs GT) with individual latency (avg per query)
             std::vector<double> e2e_latencies;
-            float ndcg10 = 0.0f, mrr10 = 0.0f;
             for (int32_t k : e2e_topk_values) {
                 knowhere::Json search_conf = direct_conf;
                 search_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = ann_ratio;
@@ -1435,11 +1496,19 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
                 auto result_ids = result.value()->GetIds();
                 e2e_recalls.push_back(calc_recall_vs_gt(result_ids, k, k));
                 e2e_latencies.push_back(e2e_latency);
-                // Compute nDCG@10 and MRR@10 from the first result with k >= 10
-                if (ndcg10 == 0.0f && k >= 10) {
-                    ndcg10 = calc_ndcg_vs_gt(result_ids, k, 10);
-                    mrr10 = calc_mrr_vs_gt(result_ids, k, 10);
-                }
+            }
+
+            // Separate k=10 search for nDCG@10 and MRR@10
+            float ndcg10 = 0.0f, mrr10 = 0.0f;
+            {
+                knowhere::Json search_conf = direct_conf;
+                search_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = ann_ratio;
+                search_conf[knowhere::meta::TOPK] = 10;
+                auto result = direct_index.value().Search(query_ds, search_conf, nullptr);
+                REQUIRE(result.has_value());
+                auto result_ids = result.value()->GetIds();
+                ndcg10 = calc_ndcg_vs_gt(result_ids, 10, 10);
+                mrr10 = calc_mrr_vs_gt(result_ids, 10, 10);
             }
 
             printf("[Direct-ratio%.1f] Recall: ", ann_ratio);
@@ -1524,7 +1593,6 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
 
             // Search for E2E Recall (vs GT) with individual latency (avg per query)
             std::vector<double> e2e_latencies;
-            float ndcg10 = 0.0f, mrr10 = 0.0f;
             for (int32_t k : e2e_topk_values) {
                 knowhere::Json search_conf = muvera_conf;
                 search_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = ann_ratio;
@@ -1538,10 +1606,19 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
                 auto result_ids = result.value()->GetIds();
                 e2e_recalls.push_back(calc_recall_vs_gt(result_ids, k, k));
                 e2e_latencies.push_back(e2e_latency);
-                if (ndcg10 == 0.0f && k >= 10) {
-                    ndcg10 = calc_ndcg_vs_gt(result_ids, k, 10);
-                    mrr10 = calc_mrr_vs_gt(result_ids, k, 10);
-                }
+            }
+
+            // Separate k=10 search for nDCG@10 and MRR@10
+            float ndcg10 = 0.0f, mrr10 = 0.0f;
+            {
+                knowhere::Json search_conf = muvera_conf;
+                search_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = ann_ratio;
+                search_conf[knowhere::meta::TOPK] = 10;
+                auto result = muvera_index.value().Search(query_ds, search_conf, nullptr);
+                REQUIRE(result.has_value());
+                auto result_ids = result.value()->GetIds();
+                ndcg10 = calc_ndcg_vs_gt(result_ids, 10, 10);
+                mrr10 = calc_mrr_vs_gt(result_ids, 10, 10);
             }
 
             printf("[MUVERA-%d-%d-r%.1f] Recall: ", num_proj, num_rep, ann_ratio);
@@ -1566,8 +1643,8 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
     // ========== LEMUR Strategy ==========
     const int32_t hidden_dim = 512;
     const int32_t num_layers = 2;
-    const int32_t num_epochs = 30;
-    const int32_t num_train_samples = 50000;
+    const int32_t num_epochs = 0;
+    const int32_t num_train_samples = 100000;
 
     printf("\n[LEMUR] Building index (h%d-l%d-e%d-s%d)...\n", hidden_dim, num_layers, num_epochs, num_train_samples);
     fflush(stdout);
@@ -1626,7 +1703,6 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
 
         // Search for E2E Recall (vs GT) with individual latency (avg per query)
         std::vector<double> e2e_latencies;
-        float ndcg10 = 0.0f, mrr10 = 0.0f;
         for (int32_t k : e2e_topk_values) {
             knowhere::Json search_conf = lemur_conf;
             search_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = ann_ratio;
@@ -1640,10 +1716,19 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
             auto result_ids = result.value()->GetIds();
             e2e_recalls.push_back(calc_recall_vs_gt(result_ids, k, k));
             e2e_latencies.push_back(e2e_latency);
-            if (ndcg10 == 0.0f && k >= 10) {
-                ndcg10 = calc_ndcg_vs_gt(result_ids, k, 10);
-                mrr10 = calc_mrr_vs_gt(result_ids, k, 10);
-            }
+        }
+
+        // Separate k=10 search for nDCG@10 and MRR@10
+        float ndcg10 = 0.0f, mrr10 = 0.0f;
+        {
+            knowhere::Json search_conf = lemur_conf;
+            search_conf[knowhere::indexparam::RETRIEVAL_ANN_RATIO] = ann_ratio;
+            search_conf[knowhere::meta::TOPK] = 10;
+            auto result = lemur_index.value().Search(query_ds, search_conf, nullptr);
+            REQUIRE(result.has_value());
+            auto result_ids = result.value()->GetIds();
+            ndcg10 = calc_ndcg_vs_gt(result_ids, 10, 10);
+            mrr10 = calc_mrr_vs_gt(result_ids, 10, 10);
         }
 
         printf("[LEMUR-ratio%.1f] Recall: ", ann_ratio);
@@ -1670,8 +1755,8 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
     int math_separator_len = 25 + 12 + (8 + 9) * (int)topk_values.size();
     for (int i = 0; i < math_separator_len; ++i) printf("=");
     printf("\n");
-    printf("                              %s: Math Recall (with Latency)                                           \n",
-           dataset_name.c_str());
+    printf("                              %s [%s]: Math Recall (with Latency)                                      \n",
+           dataset_name.c_str(), model_tag.c_str());
     for (int i = 0; i < math_separator_len; ++i) printf("=");
     printf("\n");
 
@@ -1723,8 +1808,8 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
     printf(
         "=============================================================================================================="
         "============================\n");
-    printf("                              %s: E2E Metrics                                                             \n",
-           dataset_name.c_str());
+    printf("                              %s [%s]: E2E Metrics                                                        \n",
+           dataset_name.c_str(), model_tag.c_str());
     printf(
         "=============================================================================================================="
         "============================\n");
@@ -1774,8 +1859,9 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
         "(ms)\n\n");
 
     // ========== Dataset Info ==========
-    printf("Dataset: %s - %d docs, %ld total vectors, dim=%d, avg %.1f vectors/doc\n", dataset_name.c_str(), num_docs,
-           total_vectors, dim, (float)total_vectors / num_docs);
+    printf("Dataset: %s, Model: %s\n", dataset_name.c_str(), model_tag.c_str());
+    printf("  %d docs, %ld total vectors, dim=%d, avg %.1f vectors/doc\n", num_docs, total_vectors, dim,
+           (float)total_vectors / num_docs);
     if (!SKIP_DIRECT_TEST) {
         printf("Direct Config: HNSW index on all token vectors\n");
     }
@@ -1800,21 +1886,45 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
 }
 
 TEST_CASE("LoTTE: Direct vs MUVERA vs LEMUR", "[lotte_emb_list_all]") {
-    RunMuveraLemurComparison("LoTTE", LOTTE_DOCS_JSONL_PATH, LOTTE_QUERIES_JSONL_PATH, MAX_DOCS_TO_LOAD,
+    RunMuveraLemurComparison("LoTTE", GetLotteDocsPath(), GetLotteQueriesPath(), MAX_DOCS_TO_LOAD,
                              MAX_QUERIES_TO_LOAD);
 }
 
 TEST_CASE("MS MARCO: Direct vs MUVERA vs LEMUR", "[msmarco_emb_list_all]") {
-    RunMuveraLemurComparison("MS MARCO", MSMARCO_DOCS_JSONL_PATH, MSMARCO_QUERIES_JSONL_PATH, MAX_DOCS_TO_LOAD,
+    RunMuveraLemurComparison("MS MARCO", GetMsmarcoDocsPath(), GetMsmarcoQueriesPath(), MAX_DOCS_TO_LOAD,
                              MAX_QUERIES_TO_LOAD);
 }
 
 TEST_CASE("SciFact: Direct vs MUVERA vs LEMUR", "[scifact_emb_list_all]") {
-    RunMuveraLemurComparison("SciFact", SCIFACT_DOCS_JSONL_PATH, SCIFACT_QUERIES_JSONL_PATH, MAX_DOCS_TO_LOAD,
+    RunMuveraLemurComparison("SciFact", GetScifactDocsPath(), GetScifactQueriesPath(), MAX_DOCS_TO_LOAD,
                              MAX_QUERIES_TO_LOAD);
 }
 
 TEST_CASE("TREC-COVID: Direct vs MUVERA vs LEMUR", "[trec_covid_emb_list_all]") {
-    RunMuveraLemurComparison("TREC-COVID", TREC_COVID_DOCS_JSONL_PATH, TREC_COVID_QUERIES_JSONL_PATH, 5000,
+    RunMuveraLemurComparison("TREC-COVID", GetTrecCovidDocsPath(), GetTrecCovidQueriesPath(), 5000,
                              MAX_QUERIES_TO_LOAD);
 }
+
+TEST_CASE("DocVQA: Direct vs MUVERA vs LEMUR", "[docvqa_emb_list_all]") {
+    // Small dataset (500 docs), only test recall@10 to avoid near-brute-force behavior
+    RunMuveraLemurComparison("DocVQA", GetDocvqaDocsPath(), GetDocvqaQueriesPath(), 500,
+                             MAX_QUERIES_TO_LOAD, {10}, {10});
+}
+
+/**
+ * 
+  # ColQwen2 (multi-vector)                                                                                                                            
+  MODEL_TAG=colqwen2 \                                                                                                                                 
+  MSMARCO_DOCS_PATH=./docvqa_colqwen2_docs.jsonl \                                                                                                     
+  MSMARCO_QUERIES_PATH=./docvqa_colqwen2_queries.jsonl \                                                                                               
+  ./Release/tests/ut/knowhere_tests "Test Mem Index With Muvera*"                                                                                      
+                                                                                                                                                       
+  # Qwen3-VL-Embedding (dense, 1 vector per doc)                                                                                                       
+  MODEL_TAG=qwen3vlemb2b \                                                                                                                             
+  MSMARCO_DOCS_PATH=./docvqa_qwen3vlemb2b_docs.jsonl \                                                                                                 
+  MSMARCO_QUERIES_PATH=./docvqa_qwen3vlemb2b_queries.jsonl \                                                                                           
+  ./Release/tests/ut/knowhere_tests "Test Mem Index With Muvera*"                                                                                      
+                                                                                                                                                       
+  JSONL 格式完全兼容 — 都有 chunks、gt_pids、gt_rels 字段。Dense 模型只是每个 doc/query 只有 1 个 chunk。
+
+ */

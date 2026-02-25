@@ -65,6 +65,30 @@ const std::string TREC_COVID_DENSE_QUERIES = "trec_covid_e5_queries.bin";
 const std::string TREC_COVID_DENSE_GT = "trec_covid_e5_gt.bin";
 const std::string TREC_COVID_DENSE_GT_RELS = "trec_covid_e5_gt_rels.bin";
 
+// DocVQA paths (multimodal dense - supports MODEL_TAG env var)
+constexpr int32_t MAX_DENSE_QUERIES = 100;  // Limit queries for faster testing
+
+inline std::string GetDocvqaModelTag() {
+    const char* env = std::getenv("MODEL_TAG");
+    return env ? env : "qwen3vlemb2b";
+}
+inline std::string GetDocvqaDenseDocsPath() {
+    const char* env = std::getenv("DOCVQA_DENSE_DOCS_PATH");
+    return env ? env : "docvqa_" + GetDocvqaModelTag() + "_docs.bin";
+}
+inline std::string GetDocvqaDenseQueriesPath() {
+    const char* env = std::getenv("DOCVQA_DENSE_QUERIES_PATH");
+    return env ? env : "docvqa_" + GetDocvqaModelTag() + "_queries.bin";
+}
+inline std::string GetDocvqaDenseGTPath() {
+    const char* env = std::getenv("DOCVQA_DENSE_GT_PATH");
+    return env ? env : "docvqa_" + GetDocvqaModelTag() + "_gt.bin";
+}
+inline std::string GetDocvqaDenseGTRelsPath() {
+    const char* env = std::getenv("DOCVQA_DENSE_GT_RELS_PATH");
+    return env ? env : "docvqa_" + GetDocvqaModelTag() + "_gt_rels.bin";
+}
+
 // ============================================================================
 // Data Loading Utilities
 // ============================================================================
@@ -75,7 +99,7 @@ struct DenseData {
     int64_t num_vectors = 0;
 
     bool
-    LoadFromBinary(const std::string& path) {
+    LoadFromBinary(const std::string& path, int64_t max_vectors = -1) {
         std::ifstream file(path, std::ios::binary);
         if (!file) {
             printf("Cannot open binary file: %s\n", path.c_str());
@@ -85,11 +109,20 @@ struct DenseData {
         file.read(reinterpret_cast<char*>(&dim), sizeof(int32_t));
         file.read(reinterpret_cast<char*>(&num_vectors), sizeof(int64_t));
 
+        int64_t original_count = num_vectors;
+        if (max_vectors > 0 && num_vectors > max_vectors) {
+            num_vectors = max_vectors;
+        }
+
         vectors.resize(num_vectors * dim);
         file.read(reinterpret_cast<char*>(vectors.data()), vectors.size() * sizeof(float));
 
         file.close();
-        printf("Loaded %ld vectors, dim=%d from %s\n", num_vectors, dim, path.c_str());
+        if (original_count != num_vectors) {
+            printf("Loaded %ld/%ld vectors, dim=%d from %s\n", num_vectors, original_count, dim, path.c_str());
+        } else {
+            printf("Loaded %ld vectors, dim=%d from %s\n", num_vectors, dim, path.c_str());
+        }
         return true;
     }
 
@@ -111,21 +144,32 @@ struct GTData {
     int64_t num_queries = 0;
 
     bool
-    LoadFromBinary(const std::string& path) {
+    LoadFromBinary(const std::string& path, int64_t max_queries_limit = -1) {
         std::ifstream file(path, std::ios::binary);
         if (!file) {
             printf("Cannot open GT file: %s\n", path.c_str());
             return false;
         }
 
-        file.read(reinterpret_cast<char*>(&num_queries), sizeof(int64_t));
+        int64_t total_queries;
+        file.read(reinterpret_cast<char*>(&total_queries), sizeof(int64_t));
+
+        num_queries = total_queries;
+        if (max_queries_limit > 0 && num_queries > max_queries_limit) {
+            num_queries = max_queries_limit;
+        }
         gt_pids.resize(num_queries);
 
-        for (int64_t i = 0; i < num_queries; ++i) {
+        for (int64_t i = 0; i < total_queries; ++i) {
             int64_t num_gt;
             file.read(reinterpret_cast<char*>(&num_gt), sizeof(int64_t));
-            gt_pids[i].resize(num_gt);
-            file.read(reinterpret_cast<char*>(gt_pids[i].data()), num_gt * sizeof(int64_t));
+            if (i < num_queries) {
+                gt_pids[i].resize(num_gt);
+                file.read(reinterpret_cast<char*>(gt_pids[i].data()), num_gt * sizeof(int64_t));
+            } else {
+                // Skip remaining GT data
+                file.seekg(num_gt * sizeof(int64_t), std::ios::cur);
+            }
         }
 
         file.close();
@@ -138,6 +182,9 @@ struct GTData {
             }
         }
 
+        if (total_queries != num_queries) {
+            printf("Loaded GT for %ld/%ld queries\n", num_queries, total_queries);
+        }
         PrintStats();
         return true;
     }
@@ -209,8 +256,8 @@ struct GTData {
 
         int64_t nq;
         file.read(reinterpret_cast<char*>(&nq), sizeof(int64_t));
-        if (nq != num_queries) {
-            printf("gt_rels query count mismatch: %ld vs %ld\n", nq, num_queries);
+        if (nq < num_queries) {
+            printf("gt_rels query count too small: %ld vs %ld\n", nq, num_queries);
             return false;
         }
 
@@ -218,15 +265,20 @@ struct GTData {
         gt_rels.clear();
         gt_rels.resize(num_queries);
 
-        for (int64_t i = 0; i < num_queries; ++i) {
+        for (int64_t i = 0; i < nq; ++i) {
             int64_t num_entries;
             file.read(reinterpret_cast<char*>(&num_entries), sizeof(int64_t));
-            for (int64_t j = 0; j < num_entries; ++j) {
-                int64_t pid;
-                int32_t rel;
-                file.read(reinterpret_cast<char*>(&pid), sizeof(int64_t));
-                file.read(reinterpret_cast<char*>(&rel), sizeof(int32_t));
-                gt_rels[i][pid] = rel;
+            if (i < num_queries) {
+                for (int64_t j = 0; j < num_entries; ++j) {
+                    int64_t pid;
+                    int32_t rel;
+                    file.read(reinterpret_cast<char*>(&pid), sizeof(int64_t));
+                    file.read(reinterpret_cast<char*>(&rel), sizeof(int32_t));
+                    gt_rels[i][pid] = rel;
+                }
+            } else {
+                // Skip remaining entries
+                file.seekg(num_entries * (sizeof(int64_t) + sizeof(int32_t)), std::ios::cur);
             }
         }
 
@@ -381,7 +433,7 @@ CalcMRR(const int64_t* result_ids, int32_t k, const std::vector<std::vector<int6
 void
 RunDenseTest(const std::string& dataset_name, const std::string& docs_path, const std::string& queries_path,
              const std::string& gt_path, const std::vector<int32_t>& topk_values,
-             const std::string& gt_rels_path = "") {
+             const std::string& gt_rels_path = "", int64_t max_queries = -1) {
     printf("\n");
     printf("================================================================\n");
     printf("Dense Retrieval Test: %s\n", dataset_name.c_str());
@@ -396,12 +448,12 @@ RunDenseTest(const std::string& dataset_name, const std::string& docs_path, cons
         return;
     }
 
-    if (!queries.LoadFromBinary(queries_path)) {
+    if (!queries.LoadFromBinary(queries_path, max_queries)) {
         printf("Failed to load queries, skipping test\n");
         return;
     }
 
-    if (!gt.LoadFromBinary(gt_path)) {
+    if (!gt.LoadFromBinary(gt_path, max_queries)) {
         printf("Failed to load GT, skipping test\n");
         return;
     }
@@ -447,6 +499,7 @@ RunDenseTest(const std::string& dataset_name, const std::string& docs_path, cons
         const int64_t* bf_ids = bf_result.value()->GetIds();
         bf_recalls[i] = CalcE2ERecall(bf_ids, k, gt.gt_pids, num_queries);
 
+        // nDCG@10/MRR@10 from first k >= 10 (no rerank, so top-10 is same for any k >= 10)
         if (k >= 10 && bf_ndcg10 == 0.0f) {
             bf_ndcg10 = CalcNDCG(bf_ids, 10, gt.gt_rels, num_queries);
             bf_mrr10 = CalcMRR(bf_ids, 10, gt.gt_pids, num_queries);
@@ -517,6 +570,7 @@ RunDenseTest(const std::string& dataset_name, const std::string& docs_path, cons
 
         const int64_t* ids = result.value()->GetIds();
         e2e_recalls[i] = CalcE2ERecall(ids, k, gt.gt_pids, num_queries);
+        // nDCG@10/MRR@10 from first k >= 10 (no rerank, so top-10 is same for any k >= 10)
         if (k >= 10 && ndcg10 == 0.0f) {
             ndcg10 = CalcNDCG(ids, 10, gt.gt_rels, num_queries);
             mrr10 = CalcMRR(ids, 10, gt.gt_pids, num_queries);
@@ -637,6 +691,37 @@ TEST_CASE("Dense vs Multi-Vector: TREC-COVID", "[dense_vs_multivec][trec_covid]"
     std::vector<int32_t> topk_values = {10, 20, 50, 100};
     RunDenseTest("TREC-COVID", TREC_COVID_DENSE_DOCS, TREC_COVID_DENSE_QUERIES, TREC_COVID_DENSE_GT, topk_values,
                  TREC_COVID_DENSE_GT_RELS);
+}
+
+TEST_CASE("Dense vs Multi-Vector: DocVQA", "[dense_vs_multivec][docvqa]") {
+    std::string docs_path = GetDocvqaDenseDocsPath();
+    std::string queries_path = GetDocvqaDenseQueriesPath();
+    std::string gt_path = GetDocvqaDenseGTPath();
+    std::string gt_rels_path = GetDocvqaDenseGTRelsPath();
+
+    {
+        std::ifstream docs_file(docs_path);
+        std::ifstream queries_file(queries_path);
+        std::ifstream gt_file(gt_path);
+
+        if (!docs_file.good() || !queries_file.good() || !gt_file.good()) {
+            printf("\n");
+            printf("=============================================================\n");
+            printf("DocVQA dense files not found. Prepare with:\n");
+            printf("  python scripts/prepare_docvqa_multimodal.py --output-dir . --model Qwen/Qwen3-VL-Embedding-2B\n");
+            printf("Expected files:\n");
+            printf("  - %s\n", docs_path.c_str());
+            printf("  - %s\n", queries_path.c_str());
+            printf("  - %s\n", gt_path.c_str());
+            printf("=============================================================\n");
+            SKIP("DocVQA dense files not found");
+            return;
+        }
+    }
+
+    std::vector<int32_t> topk_values = {10};  // Small dataset (500 docs), only test recall@10
+    std::string model_name = "DocVQA (" + GetDocvqaModelTag() + ")";
+    RunDenseTest(model_name, docs_path, queries_path, gt_path, topk_values, gt_rels_path, MAX_DENSE_QUERIES);
 }
 
 TEST_CASE("Dense vs Multi-Vector: Summary Comparison", "[dense_vs_multivec][summary]") {
