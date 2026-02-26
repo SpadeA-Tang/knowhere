@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Prepare SciFact ColBERTv2 multi-vector data with official ground truth annotations.
+Prepare SciFact ColBERT multi-vector data with official ground truth annotations.
 
 This script:
 1. Downloads SciFact dataset from BEIR
 2. Uses all 5183 documents (scientific abstracts)
 3. Selects queries with GT annotations
-4. Encodes with ColBERTv2 (128-dim token-level embeddings)
+4. Encodes with ColBERT (auto-detects projection dimension from model weights)
 
 Usage:
     python scripts/prepare_scifact_with_gt.py --output-dir build
@@ -34,32 +34,61 @@ SCIFACT_URL = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/dataset
 
 
 # ============================================================================
-# ColBERTv2 Encoder (same as prepare_trec_covid_colbertv2.py)
+# ColBERT Encoder (same as prepare_trec_covid_colbertv2.py)
 # ============================================================================
 
-class ColBERTv2Encoder:
-    """ColBERTv2 encoder using raw transformers (no colbert-ai dependency)."""
+class ColBERTEncoder:
+    """ColBERT encoder using raw transformers (no colbert-ai dependency).
 
-    def __init__(self, model_path="colbert-ir/colbertv2.0"):
+    Supports any ColBERT model (ColBERTv2, answerai-colbert-small-v1, jina-colbert-v2, etc.).
+    Auto-detects projection dimension and special tokens from model weights.
+    """
+
+    def __init__(self, model_path="~/models/jina-colbert-v2"):
         from transformers import AutoTokenizer, AutoModel
 
+        model_path = os.path.expanduser(model_path)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Loading ColBERTv2 from {model_path} (device={self.device})...")
+        print(f"Loading ColBERT from {model_path} (device={self.device})...")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.bert = AutoModel.from_pretrained(model_path).to(self.device).eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.bert = AutoModel.from_pretrained(model_path, trust_remote_code=True).to(self.device).eval()
 
-        self.linear = nn.Linear(self.bert.config.hidden_size, 128, bias=False).to(self.device)
-        self._load_linear_weights(model_path)
+        # Load linear projection (auto-detect dim from weights)
+        self.dim, self.linear = self._load_linear_weights(model_path)
 
-        self.q_marker_id = self.tokenizer.convert_tokens_to_ids("[unused0]")
-        self.d_marker_id = self.tokenizer.convert_tokens_to_ids("[unused1]")
+        # Auto-detect marker tokens (supports BERT and XLM-RoBERTa based models)
+        q_marker = self.tokenizer.convert_tokens_to_ids("[QueryMarker]")
+        if q_marker == self.tokenizer.unk_token_id:
+            # BERT-based model (ColBERTv2, answerai-colbert-small-v1)
+            self.q_marker_id = self.tokenizer.convert_tokens_to_ids("[unused0]")
+            self.d_marker_id = self.tokenizer.convert_tokens_to_ids("[unused1]")
+            self.attend_to_mask_tokens = False
+        else:
+            # jina-colbert-v2 style
+            self.q_marker_id = q_marker
+            self.d_marker_id = self.tokenizer.convert_tokens_to_ids("[DocumentMarker]")
+            self.attend_to_mask_tokens = True
         self.mask_id = self.tokenizer.mask_token_id
 
-        print(f"ColBERTv2 loaded: hidden={self.bert.config.hidden_size}, projection=128")
+        # Override from artifact.metadata if available
+        artifact_path = os.path.join(model_path, "artifact.metadata")
+        if os.path.isfile(artifact_path):
+            with open(artifact_path) as f:
+                metadata = json.load(f)
+            if "attend_to_mask_tokens" in metadata:
+                self.attend_to_mask_tokens = metadata["attend_to_mask_tokens"]
+
+        print(f"ColBERT loaded: hidden={self.bert.config.hidden_size}, projection={self.dim}")
+        print(f"  Q marker id={self.q_marker_id}, D marker id={self.d_marker_id}, mask id={self.mask_id}")
+        print(f"  attend_to_mask_tokens={self.attend_to_mask_tokens}")
 
     def _load_linear_weights(self, model_path):
-        loaded = False
+        """Load linear projection weights and auto-detect projection dimension."""
+        weight = None
+        key_name = None
+
+        # Try safetensors
         try:
             from safetensors.torch import load_file
             if os.path.isdir(model_path):
@@ -70,14 +99,14 @@ class ColBERTv2Encoder:
             state_dict = load_file(sf_path)
             for key, value in state_dict.items():
                 if 'linear' in key.lower() and 'weight' in key.lower():
-                    self.linear.weight.data = value.to(self.device)
-                    print(f"  Loaded linear projection from key: {key}")
-                    loaded = True
+                    weight = value
+                    key_name = key
                     break
         except Exception:
             pass
 
-        if not loaded:
+        # Try pytorch_model.bin
+        if weight is None:
             try:
                 if os.path.isdir(model_path):
                     pt_path = os.path.join(model_path, "pytorch_model.bin")
@@ -87,15 +116,23 @@ class ColBERTv2Encoder:
                 state_dict = torch.load(pt_path, map_location="cpu", weights_only=True)
                 for key, value in state_dict.items():
                     if 'linear' in key.lower() and 'weight' in key.lower():
-                        self.linear.weight.data = value.to(self.device)
-                        print(f"  Loaded linear projection from key: {key}")
-                        loaded = True
+                        weight = value
+                        key_name = key
                         break
             except Exception:
                 pass
 
-        if not loaded:
-            print("  WARNING: Could not load linear projection weights!")
+        if weight is not None:
+            proj_dim = weight.shape[0]
+            linear = nn.Linear(self.bert.config.hidden_size, proj_dim, bias=False).to(self.device)
+            linear.weight.data = weight.to(self.device)
+            print(f"  Loaded linear projection from key: {key_name} (dim={proj_dim})")
+            return proj_dim, linear
+        else:
+            print("  WARNING: Could not load linear projection weights! Using 128-dim default.")
+            proj_dim = 128
+            linear = nn.Linear(self.bert.config.hidden_size, proj_dim, bias=False).to(self.device)
+            return proj_dim, linear
 
     @torch.no_grad()
     def encode_docs(self, texts, batch_size=32, max_length=512):
@@ -131,7 +168,7 @@ class ColBERTv2Encoder:
 
             outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
             token_embs = self.linear(outputs.last_hidden_state)
-            token_embs = F.normalize(token_embs, p=2, dim=-1)
+            token_embs = F.normalize(token_embs, p=2, dim=-1).float()
 
             for j in range(len(batch)):
                 valid_embs = token_embs[j][attention_mask[j].bool()].cpu().numpy()
@@ -162,7 +199,7 @@ class ColBERTv2Encoder:
                 num_mask = max_length - len(real_seq)
                 if num_mask > 0:
                     real_seq += [self.mask_id] * num_mask
-                    attn += [0] * num_mask
+                    attn += [1 if self.attend_to_mask_tokens else 0] * num_mask
                 all_ids.append(real_seq[:max_length])
                 all_mask.append(attn[:max_length])
 
@@ -171,7 +208,7 @@ class ColBERTv2Encoder:
 
             outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
             token_embs = self.linear(outputs.last_hidden_state)
-            token_embs = F.normalize(token_embs, p=2, dim=-1)
+            token_embs = F.normalize(token_embs, p=2, dim=-1).float()
 
             for j in range(len(batch)):
                 all_embeddings.append(token_embs[j].cpu().numpy())
@@ -287,11 +324,11 @@ def load_queries_and_qrels(scifact_dir: Path, max_queries: int
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Prepare SciFact with ColBERTv2 multi-vector embeddings"
+        description="Prepare SciFact with ColBERT multi-vector embeddings"
     )
     parser.add_argument("--output-dir", type=str, default=".")
-    parser.add_argument("--model", type=str, default="colbert-ir/colbertv2.0",
-                        help="ColBERTv2 model path or HuggingFace ID")
+    parser.add_argument("--model", type=str, default="~/models/jina-colbert-v2",
+                        help="ColBERT model path or HuggingFace ID")
     parser.add_argument("--max-queries", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--doc-max-length", type=int, default=512)
@@ -315,9 +352,9 @@ def main():
     queries, qrels, qrel_grades = load_queries_and_qrels(scifact_dir, args.max_queries)
     selected_qids = list(queries.keys())
 
-    # Step 4: Load ColBERTv2
-    print(f"\n=== Step 4: Loading ColBERTv2 ===")
-    encoder = ColBERTv2Encoder(args.model)
+    # Step 4: Load ColBERT
+    print(f"\n=== Step 4: Loading ColBERT ===")
+    encoder = ColBERTEncoder(args.model)
 
     # Step 5: Encode documents
     print(f"\n=== Step 5: Encoding {len(all_pids)} documents ===")
@@ -378,7 +415,7 @@ def main():
 
     # Statistics
     print(f"\n=== Statistics ===")
-    print(f"Model: ColBERTv2 (dim=128)")
+    print(f"Model: ColBERT (dim={encoder.dim})")
     print(f"Documents: {len(doc_vec_counts)}")
     print(f"  Vectors/doc: min={min(doc_vec_counts)}, max={max(doc_vec_counts)}, "
           f"avg={np.mean(doc_vec_counts):.1f}")

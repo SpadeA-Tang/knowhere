@@ -37,7 +37,7 @@ from tqdm import tqdm
 DATASET_FILES = {
     "msmarco": ("msmarco_gt_docs.jsonl", "msmarco_gt_queries.jsonl"),
     "scifact": ("scifact_gt_docs.jsonl", "scifact_gt_queries.jsonl"),
-    "lotte": ("lotte_science_gt_docs.jsonl", "lotte_science_gt_queries.jsonl"),
+    "lotte": ("lotte_lifestyle_gt_docs.jsonl", "lotte_lifestyle_gt_queries.jsonl"),
     "trec_covid": ("trec_covid_gt_docs.jsonl", "trec_covid_gt_queries.jsonl"),
 }
 
@@ -47,9 +47,10 @@ DATASET_FILES = {
 # ============================================================================
 
 class E5Encoder:
-    def __init__(self, model_path="intfloat/e5-base-v2"):
+    def __init__(self, model_path="~/models/e5-base-v2"):
         from transformers import AutoTokenizer, AutoModel
 
+        model_path = os.path.expanduser(model_path)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Loading E5-base-v2 from {model_path} (device={self.device})...")
 
@@ -143,7 +144,7 @@ def main():
     parser.add_argument("--dataset", type=str, required=True,
                         choices=list(DATASET_FILES.keys()),
                         help="Dataset to process")
-    parser.add_argument("--model", type=str, default="intfloat/e5-base-v2",
+    parser.add_argument("--model", type=str, default="~/models/e5-base-v2",
                         help="E5 model path or HuggingFace ID")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-length", type=int, default=512)

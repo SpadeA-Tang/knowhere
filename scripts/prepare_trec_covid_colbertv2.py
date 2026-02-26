@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Prepare TREC-COVID dataset with ColBERTv2 multi-vector embeddings.
+Prepare TREC-COVID dataset with ColBERT multi-vector embeddings.
 
 This script:
 1. Downloads TREC-COVID dataset from BEIR (freely available)
 2. Randomly samples N documents from the full 171K corpus
 3. Selects queries that have sufficient GT coverage in the sample
-4. Encodes with ColBERTv2 (128-dim token-level embeddings)
+4. Encodes with ColBERT (auto-detects projection dimension from model weights)
 5. Saves JSONL files compatible with knowhere multi-vector tests
 
 Usage:
@@ -36,32 +36,60 @@ TREC_COVID_URL = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/data
 
 
 # ============================================================================
-# ColBERTv2 Encoder
+# ColBERT Encoder
 # ============================================================================
 
-class ColBERTv2Encoder:
-    """ColBERTv2 encoder using raw transformers (no colbert-ai dependency)."""
+class ColBERTEncoder:
+    """ColBERT encoder using raw transformers (no colbert-ai dependency).
 
-    def __init__(self, model_path="colbert-ir/colbertv2.0"):
+    Supports any ColBERT model (ColBERTv2, answerai-colbert-small-v1, jina-colbert-v2, etc.).
+    Auto-detects projection dimension and special tokens from model weights.
+    """
+
+    def __init__(self, model_path="~/models/jina-colbert-v2"):
         from transformers import AutoTokenizer, AutoModel
 
+        model_path = os.path.expanduser(model_path)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Loading ColBERTv2 from {model_path} (device={self.device})...")
+        print(f"Loading ColBERT from {model_path} (device={self.device})...")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.bert = AutoModel.from_pretrained(model_path).to(self.device).eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.bert = AutoModel.from_pretrained(model_path, trust_remote_code=True).to(self.device).eval()
 
-        self.linear = nn.Linear(self.bert.config.hidden_size, 128, bias=False).to(self.device)
-        self._load_linear_weights(model_path)
+        # Load linear projection (auto-detect dim from weights)
+        self.dim, self.linear = self._load_linear_weights(model_path)
 
-        self.q_marker_id = self.tokenizer.convert_tokens_to_ids("[unused0]")
-        self.d_marker_id = self.tokenizer.convert_tokens_to_ids("[unused1]")
+        # Auto-detect marker tokens (supports BERT and XLM-RoBERTa based models)
+        q_marker = self.tokenizer.convert_tokens_to_ids("[QueryMarker]")
+        if q_marker == self.tokenizer.unk_token_id:
+            # BERT-based model (ColBERTv2, answerai-colbert-small-v1)
+            self.q_marker_id = self.tokenizer.convert_tokens_to_ids("[unused0]")
+            self.d_marker_id = self.tokenizer.convert_tokens_to_ids("[unused1]")
+            self.attend_to_mask_tokens = False
+        else:
+            # jina-colbert-v2 style
+            self.q_marker_id = q_marker
+            self.d_marker_id = self.tokenizer.convert_tokens_to_ids("[DocumentMarker]")
+            self.attend_to_mask_tokens = True
         self.mask_id = self.tokenizer.mask_token_id
 
-        print(f"ColBERTv2 loaded: hidden={self.bert.config.hidden_size}, projection=128")
+        # Override from artifact.metadata if available
+        artifact_path = os.path.join(model_path, "artifact.metadata")
+        if os.path.isfile(artifact_path):
+            with open(artifact_path) as f:
+                metadata = json.load(f)
+            if "attend_to_mask_tokens" in metadata:
+                self.attend_to_mask_tokens = metadata["attend_to_mask_tokens"]
+
+        print(f"ColBERT loaded: hidden={self.bert.config.hidden_size}, projection={self.dim}")
+        print(f"  Q marker id={self.q_marker_id}, D marker id={self.d_marker_id}, mask id={self.mask_id}")
+        print(f"  attend_to_mask_tokens={self.attend_to_mask_tokens}")
 
     def _load_linear_weights(self, model_path):
-        loaded = False
+        """Load linear projection weights and auto-detect projection dimension."""
+        weight = None
+        key_name = None
+
         # Try safetensors
         try:
             from safetensors.torch import load_file
@@ -73,15 +101,14 @@ class ColBERTv2Encoder:
             state_dict = load_file(sf_path)
             for key, value in state_dict.items():
                 if 'linear' in key.lower() and 'weight' in key.lower():
-                    self.linear.weight.data = value.to(self.device)
-                    print(f"  Loaded linear projection from key: {key}")
-                    loaded = True
+                    weight = value
+                    key_name = key
                     break
         except Exception:
             pass
 
         # Try pytorch_model.bin
-        if not loaded:
+        if weight is None:
             try:
                 if os.path.isdir(model_path):
                     pt_path = os.path.join(model_path, "pytorch_model.bin")
@@ -91,23 +118,27 @@ class ColBERTv2Encoder:
                 state_dict = torch.load(pt_path, map_location="cpu", weights_only=True)
                 for key, value in state_dict.items():
                     if 'linear' in key.lower() and 'weight' in key.lower():
-                        self.linear.weight.data = value.to(self.device)
-                        print(f"  Loaded linear projection from key: {key}")
-                        loaded = True
+                        weight = value
+                        key_name = key
                         break
             except Exception:
                 pass
 
-        if not loaded:
-            print("  WARNING: Could not load linear projection weights!")
+        if weight is not None:
+            proj_dim = weight.shape[0]
+            linear = nn.Linear(self.bert.config.hidden_size, proj_dim, bias=False).to(self.device)
+            linear.weight.data = weight.to(self.device)
+            print(f"  Loaded linear projection from key: {key_name} (dim={proj_dim})")
+            return proj_dim, linear
+        else:
+            print("  WARNING: Could not load linear projection weights! Using 128-dim default.")
+            proj_dim = 128
+            linear = nn.Linear(self.bert.config.hidden_size, proj_dim, bias=False).to(self.device)
+            return proj_dim, linear
 
     @torch.no_grad()
     def encode_docs(self, texts, batch_size=32, max_length=512):
-        """Encode documents: [CLS] [D] tok1...tokN [SEP] [PAD]...
-
-        Standard ColBERT doc format. Output includes all attended tokens
-        (everything except [PAD]).
-        """
+        """Encode documents: [CLS] [D] tok1...tokN [SEP] [PAD]..."""
         cls_id = self.tokenizer.cls_token_id
         sep_id = self.tokenizer.sep_token_id
         pad_id = self.tokenizer.pad_token_id
@@ -116,10 +147,9 @@ class ColBERTv2Encoder:
         for i in tqdm(range(0, len(texts), batch_size), desc="Encoding docs"):
             batch = texts[i:i + batch_size]
 
-            # Tokenize without special tokens
             encoded = self.tokenizer(
                 batch, add_special_tokens=False, truncation=True,
-                max_length=max_length - 3,  # reserve [CLS] + [D] + [SEP]
+                max_length=max_length - 3,
                 return_attention_mask=False,
             )
 
@@ -140,7 +170,7 @@ class ColBERTv2Encoder:
 
             outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
             token_embs = self.linear(outputs.last_hidden_state)
-            token_embs = F.normalize(token_embs, p=2, dim=-1)
+            token_embs = F.normalize(token_embs, p=2, dim=-1).float()
 
             for j in range(len(batch)):
                 valid_embs = token_embs[j][attention_mask[j].bool()].cpu().numpy()
@@ -153,8 +183,9 @@ class ColBERTv2Encoder:
 
         Standard ColBERT query format:
         - [MASK] tokens placed AFTER [SEP]
-        - attention_mask = 1 for [CLS] through [SEP], 0 for [MASK]
-        - Output ALL max_length embeddings (including [MASK] with attn=0)
+        - attention_mask for [MASK]: depends on attend_to_mask_tokens
+          (False for ColBERTv2/answerai, True for jina-colbert-v2)
+        - Output ALL max_length embeddings (including [MASK])
         """
         cls_id = self.tokenizer.cls_token_id
         sep_id = self.tokenizer.sep_token_id
@@ -176,11 +207,11 @@ class ColBERTv2Encoder:
                 # [CLS] [Q] tok1 tok2 ... tokN [SEP] [MASK] [MASK] ... [MASK]
                 real_seq = [cls_id, self.q_marker_id] + token_ids + [sep_id]
                 attn = [1] * len(real_seq)
-                # Pad remainder with [MASK] (attention_mask=0)
+                # Pad remainder with [MASK]
                 num_mask = max_length - len(real_seq)
                 if num_mask > 0:
                     real_seq += [self.mask_id] * num_mask
-                    attn += [0] * num_mask
+                    attn += [1 if self.attend_to_mask_tokens else 0] * num_mask
                 all_ids.append(real_seq[:max_length])
                 all_mask.append(attn[:max_length])
 
@@ -189,9 +220,9 @@ class ColBERTv2Encoder:
 
             outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
             token_embs = self.linear(outputs.last_hidden_state)
-            token_embs = F.normalize(token_embs, p=2, dim=-1)
+            token_embs = F.normalize(token_embs, p=2, dim=-1).float()
 
-            # Output ALL max_length embeddings (including [MASK] with attn=0)
+            # Output ALL max_length embeddings (including [MASK])
             for j in range(len(batch)):
                 all_embeddings.append(token_embs[j].cpu().numpy())
         return all_embeddings
@@ -260,11 +291,7 @@ def load_queries(queries_path: Path, needed_qids: Set[str]) -> Dict[str, str]:
             q = json.loads(line)
             qid = q['_id']
             if qid in needed_qids:
-                # TREC-COVID queries may have metadata field
                 text = q.get('text', '')
-                metadata = q.get('metadata', {})
-                if isinstance(metadata, dict) and metadata.get('query'):
-                    text = metadata['query']
                 queries[qid] = text
     print(f"  Found {len(queries)}/{len(needed_qids)} query texts")
     return queries
@@ -312,14 +339,14 @@ def select_documents_random(corpus_path: Path, max_docs: int
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Prepare TREC-COVID with ColBERTv2 multi-vector embeddings"
+        description="Prepare TREC-COVID with ColBERT multi-vector embeddings"
     )
     parser.add_argument("--data-dir", type=str, default=None,
                         help="TREC-COVID directory (BEIR format). Auto-downloads if not provided.")
     parser.add_argument("--output-dir", type=str, default=".",
                         help="Output directory for JSONL files")
-    parser.add_argument("--model", type=str, default="colbert-ir/colbertv2.0",
-                        help="ColBERTv2 model path or HuggingFace ID")
+    parser.add_argument("--model", type=str, default="~/models/jina-colbert-v2",
+                        help="ColBERT model path or HuggingFace ID")
     parser.add_argument("--max-queries", type=int, default=50,
                         help="Max queries (TREC-COVID has ~50)")
     parser.add_argument("--max-docs", type=int, default=5000,
@@ -388,9 +415,9 @@ def main():
     print(f"  GT docs in sample: {len(gt_doc_ids)}, "
           f"GT ratio: {len(gt_doc_ids)/len(docs)*100:.1f}%")
 
-    # Step 5: Load ColBERTv2
-    print(f"\n=== Step 5: Loading ColBERTv2 ===")
-    encoder = ColBERTv2Encoder(args.model)
+    # Step 5: Load ColBERT
+    print(f"\n=== Step 5: Loading ColBERT ===")
+    encoder = ColBERTEncoder(args.model)
 
     # Step 6: Encode documents
     print(f"\n=== Step 6: Encoding {len(all_pids)} documents ===")
@@ -452,7 +479,7 @@ def main():
 
     # Statistics
     print(f"\n=== Statistics ===")
-    print(f"Model: ColBERTv2 (dim=128)")
+    print(f"Model: ColBERT (dim={encoder.dim})")
     print(f"Documents: {len(doc_vec_counts)} (randomly sampled from 171K)")
     print(f"  GT docs in sample: {len(gt_doc_ids)} ({len(gt_doc_ids)/len(doc_vec_counts)*100:.1f}%)")
     print(f"  Non-GT docs: {len(doc_vec_counts) - len(gt_doc_ids)} ({(len(doc_vec_counts) - len(gt_doc_ids))/len(doc_vec_counts)*100:.1f}%)")
