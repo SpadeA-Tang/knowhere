@@ -59,19 +59,69 @@ class ColBERTEncoder:
         # Load linear projection (auto-detect dim from weights)
         self.dim, self.linear = self._load_linear_weights(model_path)
 
-        # Auto-detect marker tokens (supports BERT and XLM-RoBERTa based models)
-        q_marker = self.tokenizer.convert_tokens_to_ids("[QueryMarker]")
-        if q_marker == self.tokenizer.unk_token_id:
-            # BERT-based model (ColBERTv2, answerai-colbert-small-v1)
+        # Auto-detect text prompts and settings from config_sentence_transformers.json (pylate format)
+        self.query_prefix = ""
+        self.doc_prefix = ""
+        self._attend_to_expansion = None
+        self._do_query_expansion = True
+        self._st_marker_q = None
+        self._st_marker_d = None
+        st_config_path = os.path.join(model_path, "config_sentence_transformers.json")
+        if os.path.isfile(st_config_path):
+            with open(st_config_path) as f:
+                st_config = json.load(f)
+            prompts = st_config.get("prompts", {})
+            self.query_prefix = prompts.get("query", "")
+            self.doc_prefix = prompts.get("document", "")
+            if "attend_to_expansion_tokens" in st_config:
+                self._attend_to_expansion = st_config["attend_to_expansion_tokens"]
+            self._do_query_expansion = st_config.get("do_query_expansion", True)
+            # Marker token strings (e.g. "[Q] ", "[unused0]")
+            self._st_marker_q = st_config.get("query_prefix", None)
+            self._st_marker_d = st_config.get("document_prefix", None)
+
+        # Auto-detect marker tokens
+        # Priority: config_sentence_transformers.json > [QueryMarker] > [Q]/[Q] > [unused0]
+        self.q_marker_id = None
+        self.attend_to_mask_tokens = False
+
+        # 1. From config_sentence_transformers.json (most reliable for pylate models)
+        if self._st_marker_q:
+            tid = self.tokenizer.convert_tokens_to_ids(self._st_marker_q)
+            if tid != self.tokenizer.unk_token_id:
+                self.q_marker_id = tid
+                self.d_marker_id = self.tokenizer.convert_tokens_to_ids(self._st_marker_d)
+                self.attend_to_mask_tokens = True
+
+        # 2. [QueryMarker] / [DocumentMarker] (jina-colbert-v2)
+        if self.q_marker_id is None:
+            tid = self.tokenizer.convert_tokens_to_ids("[QueryMarker]")
+            if tid != self.tokenizer.unk_token_id:
+                self.q_marker_id = tid
+                self.d_marker_id = self.tokenizer.convert_tokens_to_ids("[DocumentMarker]")
+                self.attend_to_mask_tokens = True
+
+        # 3. [Q] / [D] with or without trailing space (pylate without config)
+        if self.q_marker_id is None:
+            for q_tok, d_tok in [("[Q]", "[D]"), ("[Q] ", "[D] ")]:
+                tid = self.tokenizer.convert_tokens_to_ids(q_tok)
+                if tid != self.tokenizer.unk_token_id:
+                    self.q_marker_id = tid
+                    self.d_marker_id = self.tokenizer.convert_tokens_to_ids(d_tok)
+                    self.attend_to_mask_tokens = True
+                    break
+
+        # 4. Fallback: [unused0] / [unused1] (ColBERTv2, answerai without config)
+        if self.q_marker_id is None:
             self.q_marker_id = self.tokenizer.convert_tokens_to_ids("[unused0]")
             self.d_marker_id = self.tokenizer.convert_tokens_to_ids("[unused1]")
             self.attend_to_mask_tokens = False
-        else:
-            # jina-colbert-v2 style
-            self.q_marker_id = q_marker
-            self.d_marker_id = self.tokenizer.convert_tokens_to_ids("[DocumentMarker]")
-            self.attend_to_mask_tokens = True
+
         self.mask_id = self.tokenizer.mask_token_id
+
+        # Override attend_to_mask from config_sentence_transformers.json if available
+        if self._attend_to_expansion is not None:
+            self.attend_to_mask_tokens = self._attend_to_expansion
 
         # Override from artifact.metadata if available
         artifact_path = os.path.join(model_path, "artifact.metadata")
@@ -83,7 +133,9 @@ class ColBERTEncoder:
 
         print(f"ColBERT loaded: hidden={self.bert.config.hidden_size}, projection={self.dim}")
         print(f"  Q marker id={self.q_marker_id}, D marker id={self.d_marker_id}, mask id={self.mask_id}")
-        print(f"  attend_to_mask_tokens={self.attend_to_mask_tokens}")
+        print(f"  attend_to_mask_tokens={self.attend_to_mask_tokens}, do_query_expansion={self._do_query_expansion}")
+        if self.query_prefix or self.doc_prefix:
+            print(f"  query_prefix='{self.query_prefix}', doc_prefix='{self.doc_prefix}'")
 
     def _load_linear_weights(self, model_path):
         """Load linear projection weights and auto-detect projection dimension."""
@@ -124,6 +176,24 @@ class ColBERTEncoder:
             except Exception:
                 pass
 
+        # Try pylate Dense subdirectories (e.g., 1_Dense/, 2_Dense/)
+        if weight is None and os.path.isdir(model_path):
+            try:
+                from safetensors.torch import load_file
+                for dense_dir in ["1_Dense", "2_Dense"]:
+                    dense_sf = os.path.join(model_path, dense_dir, "model.safetensors")
+                    if os.path.isfile(dense_sf):
+                        state_dict = load_file(dense_sf)
+                        for key, value in state_dict.items():
+                            if 'weight' in key.lower():
+                                weight = value
+                                key_name = f"{dense_dir}/{key}"
+                                break
+                        if weight is not None:
+                            break
+            except Exception:
+                pass
+
         if weight is not None:
             proj_dim = weight.shape[0]
             linear = nn.Linear(self.bert.config.hidden_size, proj_dim, bias=False).to(self.device)
@@ -139,6 +209,8 @@ class ColBERTEncoder:
     @torch.no_grad()
     def encode_docs(self, texts, batch_size=32, max_length=512):
         """Encode documents: [CLS] [D] tok1...tokN [SEP] [PAD]..."""
+        if self.doc_prefix:
+            texts = [self.doc_prefix + t for t in texts]
         cls_id = self.tokenizer.cls_token_id
         sep_id = self.tokenizer.sep_token_id
         pad_id = self.tokenizer.pad_token_id
@@ -185,10 +257,14 @@ class ColBERTEncoder:
         - [MASK] tokens placed AFTER [SEP]
         - attention_mask for [MASK]: depends on attend_to_mask_tokens
           (False for ColBERTv2/answerai, True for jina-colbert-v2)
-        - Output ALL max_length embeddings (including [MASK])
+        - do_query_expansion=True (default): pad with [MASK], output all max_length embeddings
+        - do_query_expansion=False (ColBERT-Zero): no [MASK] padding, output only real tokens
         """
+        if self.query_prefix:
+            texts = [self.query_prefix + t for t in texts]
         cls_id = self.tokenizer.cls_token_id
         sep_id = self.tokenizer.sep_token_id
+        pad_id = self.tokenizer.pad_token_id
 
         all_embeddings = []
         for i in tqdm(range(0, len(texts), batch_size), desc="Encoding queries"):
@@ -203,17 +279,29 @@ class ColBERTEncoder:
 
             all_ids = []
             all_mask = []
+            real_lengths = []
             for token_ids in encoded['input_ids']:
-                # [CLS] [Q] tok1 tok2 ... tokN [SEP] [MASK] [MASK] ... [MASK]
+                # [CLS] [Q] tok1 tok2 ... tokN [SEP]
                 real_seq = [cls_id, self.q_marker_id] + token_ids + [sep_id]
                 attn = [1] * len(real_seq)
-                # Pad remainder with [MASK]
-                num_mask = max_length - len(real_seq)
-                if num_mask > 0:
-                    real_seq += [self.mask_id] * num_mask
-                    attn += [1 if self.attend_to_mask_tokens else 0] * num_mask
-                all_ids.append(real_seq[:max_length])
-                all_mask.append(attn[:max_length])
+                real_lengths.append(len(real_seq))
+
+                if self._do_query_expansion:
+                    # Pad remainder with [MASK] (ColBERTv2, Jina, Answerai)
+                    num_mask = max_length - len(real_seq)
+                    if num_mask > 0:
+                        real_seq += [self.mask_id] * num_mask
+                        attn += [1 if self.attend_to_mask_tokens else 0] * num_mask
+                    all_ids.append(real_seq[:max_length])
+                    all_mask.append(attn[:max_length])
+                else:
+                    # No expansion (ColBERT-Zero): pad with [PAD] for batching only
+                    pad_len = max_length - len(real_seq)
+                    if pad_len > 0:
+                        real_seq += [pad_id] * pad_len
+                        attn += [0] * pad_len
+                    all_ids.append(real_seq[:max_length])
+                    all_mask.append(attn[:max_length])
 
             input_ids = torch.tensor(all_ids, dtype=torch.long, device=self.device)
             attention_mask = torch.tensor(all_mask, dtype=torch.long, device=self.device)
@@ -222,9 +310,13 @@ class ColBERTEncoder:
             token_embs = self.linear(outputs.last_hidden_state)
             token_embs = F.normalize(token_embs, p=2, dim=-1).float()
 
-            # Output ALL max_length embeddings (including [MASK])
             for j in range(len(batch)):
-                all_embeddings.append(token_embs[j].cpu().numpy())
+                if self._do_query_expansion:
+                    # Output ALL max_length embeddings (including [MASK])
+                    all_embeddings.append(token_embs[j].cpu().numpy())
+                else:
+                    # Output only real tokens (no expansion)
+                    all_embeddings.append(token_embs[j][:real_lengths[j]].cpu().numpy())
         return all_embeddings
 
 
@@ -357,6 +449,9 @@ def main():
     parser.add_argument("--doc-max-length", type=int, default=512)
     parser.add_argument("--query-max-length", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--model-tag", type=str, default="gt",
+                        help="Model tag for output filenames (e.g., colbertv2, colbertzero). "
+                             "Output: trec_covid_{model_tag}_docs.jsonl")
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -424,7 +519,7 @@ def main():
     doc_texts = [docs[pid] for pid in all_pids]
     doc_embeddings = encoder.encode_docs(doc_texts, args.batch_size, args.doc_max_length)
 
-    doc_path = output_dir / "trec_covid_gt_docs.jsonl"
+    doc_path = output_dir / f"trec_covid_{args.model_tag}_docs.jsonl"
     doc_vec_counts = []
 
     with open(doc_path, 'w') as f:
@@ -449,7 +544,7 @@ def main():
     query_texts = [queries[qid] for qid in selected_qids]
     query_embeddings = encoder.encode_queries(query_texts, args.batch_size, args.query_max_length)
 
-    query_path = output_dir / "trec_covid_gt_queries.jsonl"
+    query_path = output_dir / f"trec_covid_{args.model_tag}_queries.jsonl"
     query_vec_counts = []
     gt_counts = []
 

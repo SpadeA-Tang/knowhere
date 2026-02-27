@@ -77,10 +77,10 @@ inline std::string GetMsmarcoQueriesPath() {
 
 // LoTTE data file paths
 inline std::string GetLotteDocsPath() {
-    return GetEnvOr("LOTTE_DOCS_PATH", BuildDataPath("lotte_science", "docs"));
+    return GetEnvOr("LOTTE_DOCS_PATH", BuildDataPath("lotte_lifestyle", "docs"));
 }
 inline std::string GetLotteQueriesPath() {
-    return GetEnvOr("LOTTE_QUERIES_PATH", BuildDataPath("lotte_science", "queries"));
+    return GetEnvOr("LOTTE_QUERIES_PATH", BuildDataPath("lotte_lifestyle", "queries"));
 }
 
 // SciFact data file paths
@@ -1739,8 +1739,8 @@ RunMuveraLemurComparison(const std::string& dataset_name, const std::string& doc
     // ========== LEMUR Strategy ==========
     const int32_t hidden_dim = 512;
     const int32_t num_layers = 2;
-    const int32_t num_epochs = 0;
-    const int32_t num_train_samples = 100000;
+    const int32_t num_epochs = 30;
+    const int32_t num_train_samples = 50000;
 
     printf("\n[LEMUR] Building index (h%d-l%d-e%d-s%d)...\n", hidden_dim, num_layers, num_epochs, num_train_samples);
     fflush(stdout);
